@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"pim-manager/pkg/dynamodb"
 	"pim-manager/pkg/identitycenter"
 	"time"
 
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/google/uuid"
 )
 
@@ -14,6 +18,28 @@ var (
 	expiration    dynamodb.Timestamp = 60 // 1 minute
 	Region        string
 	DynamoDbTable string
+
+	// Test SQS event for local testing
+	testSQSEvent = events.SQSEvent{
+		Records: []events.SQSMessage{
+			{
+				MessageId:     "19dd0b57-b21e-4ac1-bd88-01bbb068cb78",
+				ReceiptHandle: "MessageReceiptHandle",
+				Body:          "Hello from SQS!",
+				Attributes: map[string]string{
+					"ApproximateReceiveCount":          "1",
+					"SentTimestamp":                    "1523232000000",
+					"SenderId":                         "123456789012",
+					"ApproximateFirstReceiveTimestamp": "1523232000001",
+				},
+				MessageAttributes: map[string]events.SQSMessageAttribute{},
+				Md5OfBody:         "{{{md5_of_body}}}",
+				EventSource:       "aws:sqs",
+				EventSourceARN:    "arn:aws:sqs:us-east-1:123456789012:MyQueue",
+				AWSRegion:         "us-east-1",
+			},
+		},
+	}
 )
 
 func init() {
@@ -28,9 +54,67 @@ func init() {
 	}
 }
 
-func main() {
+// lambdaHandler handles SQS events from AWS Lambda
+func lambdaHandler(ctx context.Context, sqsEvent events.SQSEvent) error {
+	fmt.Printf("Received SQS event with %d records\n", len(sqsEvent.Records))
+	
+	for i, record := range sqsEvent.Records {
+		fmt.Printf("=== SQS Record %d/%d ===\n", i+1, len(sqsEvent.Records))
+		fmt.Printf("MessageId: %s\n", record.MessageId)
+		fmt.Printf("EventSource: %s\n", record.EventSource)
+		fmt.Printf("EventSourceARN: %s\n", record.EventSourceARN)
+		fmt.Printf("ReceiptHandle: %s\n", record.ReceiptHandle)
+		fmt.Printf("Body: %s\n", record.Body)
+		
+		// Pretty print the message body if it's JSON
+		var prettyJSON map[string]interface{}
+		if err := json.Unmarshal([]byte(record.Body), &prettyJSON); err == nil {
+			prettyBytes, _ := json.MarshalIndent(prettyJSON, "", "  ")
+			fmt.Printf("Parsed JSON Body:\n%s\n", string(prettyBytes))
+		}
+		
+		// Print message attributes if any
+		if len(record.MessageAttributes) > 0 {
+			fmt.Println("Message Attributes:")
+			for key, attr := range record.MessageAttributes {
+				var value, dataType string
+				if attr.StringValue != nil {
+					value = *attr.StringValue
+				}
+				dataType = attr.DataType
+				fmt.Printf("  %s: %s (Type: %s)\n", key, value, dataType)
+			}
+		}
+		
+		fmt.Printf("Attributes: %+v\n", record.Attributes)
+		fmt.Println("========================")
+	}
+	
+	return nil
+}
 
-	err := sqsCheckExpiredSessions(DynamoDbTable, Region)
+func main() {
+	// Check if running in Lambda environment
+	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
+		fmt.Println("Starting Lambda handler...")
+		lambda.Start(lambdaHandler)
+		return
+	}
+
+	// Local development/testing mode
+	fmt.Println("Running in local mode...")
+	
+	// Test the Lambda handler with test SQS event
+	fmt.Println("Testing Lambda handler with test SQS event...")
+	err := lambdaHandler(context.Background(), testSQSEvent)
+	if err != nil {
+		fmt.Printf("Error in Lambda handler: %v\n", err)
+		panic(err)
+	}
+	fmt.Println("Lambda handler test completed successfully!")
+	
+	// Run the existing expired sessions check
+	err = sqsCheckExpiredSessions(DynamoDbTable, Region)
 	if err != nil {
 		fmt.Printf("Error checking expired sessions: %v\n", err)
 		panic(err)
