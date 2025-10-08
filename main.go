@@ -7,6 +7,7 @@ import (
 	"os"
 	"pim-manager/pkg/dynamodb"
 	"pim-manager/pkg/identitycenter"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,7 +21,7 @@ import (
 )
 
 var (
-	expiration        dynamodb.Timestamp = 60 // 1 minute
+	expiration        dynamodb.Timestamp
 	Region            string
 	DynamoDbTable     string
 	ApproversSecret   string
@@ -61,8 +62,48 @@ func init() {
 		panic(fmt.Errorf("MANAGEMENT_ACCOUNT is not set!"))
 	}
 	fmt.Printf("✅ MANAGEMENT_ACCOUNT set to: %s\n", ManagementAccount)
+
+	sessionTimeoutStr := os.Getenv("SESSION_TIMEOUT")
+	fmt.Printf("SESSION_TIMEOUT environment variable: '%s'\n", sessionTimeoutStr)
+	if sessionTimeoutStr == "" {
+		fmt.Println("WARNING: SESSION_TIMEOUT is not set, using default 3600 seconds (1 hour)")
+		expiration = 3600 // Default to 1 hour
+	} else {
+		timeoutSeconds, err := strconv.ParseInt(sessionTimeoutStr, 10, 64)
+		if err != nil {
+			fmt.Printf("ERROR: SESSION_TIMEOUT is not a valid number: %v\n", err)
+			panic(fmt.Errorf("SESSION_TIMEOUT must be a valid number of seconds"))
+		}
+		if timeoutSeconds <= 0 {
+			fmt.Printf("ERROR: SESSION_TIMEOUT must be positive, got: %d\n", timeoutSeconds)
+			panic(fmt.Errorf("SESSION_TIMEOUT must be positive"))
+		}
+		expiration = dynamodb.Timestamp(timeoutSeconds)
+	}
+	fmt.Printf("✅ SESSION_TIMEOUT set to: %d seconds (%s)\n", expiration, formatDuration(int64(expiration)))
 	
 	fmt.Println("=== Lambda Function Initialization Complete ===")
+}
+
+// formatDuration converts seconds to human-readable format
+func formatDuration(seconds int64) string {
+	if seconds < 60 {
+		return fmt.Sprintf("%d seconds", seconds)
+	} else if seconds < 3600 {
+		minutes := seconds / 60
+		remainingSeconds := seconds % 60
+		if remainingSeconds == 0 {
+			return fmt.Sprintf("%d minutes", minutes)
+		}
+		return fmt.Sprintf("%d minutes %d seconds", minutes, remainingSeconds)
+	} else {
+		hours := seconds / 3600
+		remainingMinutes := (seconds % 3600) / 60
+		if remainingMinutes == 0 {
+			return fmt.Sprintf("%d hours", hours)
+		}
+		return fmt.Sprintf("%d hours %d minutes", hours, remainingMinutes)
+	}
 }
 
 // SQSMessage represents the expected structure of SQS message body
@@ -143,7 +184,8 @@ func sendEmailNotification(requestor, status, reason, account, region string) er
 	svc := ses.New(sess)
 	
 	var subject, body string
-	if status == "APPROVED" {
+	switch status {
+	case "APPROVED":
 		subject = fmt.Sprintf("✅ PIM Request Approved - Account %s", account)
 		body = fmt.Sprintf(`
 Your Privileged Identity Management (PIM) request has been APPROVED.
@@ -158,7 +200,22 @@ You should now have access to the requested AWS account.
 
 This is an automated notification from the PIM system.
 		`, account, status)
-	} else {
+	case "EXPIRED":
+		subject = fmt.Sprintf("⏰ PIM Access Expired - Account %s", account)
+		body = fmt.Sprintf(`
+Your Privileged Identity Management (PIM) access has EXPIRED and been automatically removed.
+
+Details:
+- Account: %s
+- Permission Set: AdministratorAccess
+- Status: %s
+- Reason: %s
+
+Your temporary access has been revoked. If you need continued access, please submit a new request.
+
+This is an automated notification from the PIM system.
+		`, account, status, reason)
+	default: // REJECTED
 		subject = fmt.Sprintf("❌ PIM Request Rejected - Account %s", account)
 		body = fmt.Sprintf(`
 Your Privileged Identity Management (PIM) request has been REJECTED.
@@ -202,8 +259,40 @@ This is an automated notification from the PIM system.
 	return nil
 }
 
-// lambdaHandler handles SQS events from AWS Lambda
-func lambdaHandler(ctx context.Context, sqsEvent events.SQSEvent) error {
+// universalHandler handles both SQS and EventBridge events
+func universalHandler(ctx context.Context, event interface{}) error {
+	fmt.Printf("🔔 Received Lambda event\n")
+	
+	// Try to determine event type by checking the event structure
+	eventBytes, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("failed to marshal event: %v", err)
+	}
+	
+	// Check if it's an SQS event
+	var sqsEvent events.SQSEvent
+	if err := json.Unmarshal(eventBytes, &sqsEvent); err == nil && len(sqsEvent.Records) > 0 {
+		// Check if first record has SQS-specific fields
+		if sqsEvent.Records[0].EventSource == "aws:sqs" {
+			fmt.Printf("📋 Detected SQS event with %d records\n", len(sqsEvent.Records))
+			return handleSQSEvent(ctx, sqsEvent)
+		}
+	}
+	
+	// Check if it's an EventBridge event
+	var eventBridgeEvent events.CloudWatchEvent
+	if err := json.Unmarshal(eventBytes, &eventBridgeEvent); err == nil && eventBridgeEvent.Source != "" {
+		fmt.Printf("⏰ Detected EventBridge scheduled event\n")
+		return handleScheduledEvent(ctx, eventBridgeEvent)
+	}
+	
+	// If we can't determine the event type, log the raw event
+	fmt.Printf("❓ Unknown event type received: %s\n", string(eventBytes))
+	return fmt.Errorf("unsupported event type")
+}
+
+// handleSQSEvent processes SQS messages for permission assignment
+func handleSQSEvent(ctx context.Context, sqsEvent events.SQSEvent) error {
 	fmt.Printf("🔔 Received SQS event with %d records\n", len(sqsEvent.Records))
 
 	for i, record := range sqsEvent.Records {
@@ -309,6 +398,106 @@ func lambdaHandler(ctx context.Context, sqsEvent events.SQSEvent) error {
 	return nil
 }
 
+// handleScheduledEvent processes EventBridge scheduled events for cleanup
+func handleScheduledEvent(ctx context.Context, event events.CloudWatchEvent) error {
+	fmt.Printf("⏰ === SCHEDULED CLEANUP STARTED ===\n")
+	fmt.Printf("📅 Event Source: %s\n", event.Source)
+	fmt.Printf("🔍 Detail Type: %s\n", event.DetailType)
+	fmt.Printf("⏰ Event Time: %s\n", event.Time.Format(time.RFC3339))
+	
+	// Check for expired sessions and remove permissions
+	err := processExpiredSessions(DynamoDbTable, Region)
+	if err != nil {
+		fmt.Printf("❌ Error processing expired sessions: %v\n", err)
+		return err
+	}
+	
+	fmt.Printf("✅ Scheduled cleanup completed successfully\n")
+	return nil
+}
+
+// processExpiredSessions finds and removes expired permission assignments
+func processExpiredSessions(table string, region string) error {
+	fmt.Printf("🔍 Checking for expired sessions in table: %s\n", table)
+	
+	dynamo, err := dynamoDbInitialize(table)
+	if err != nil {
+		return fmt.Errorf("failed to initialize DynamoDB: %v", err)
+	}
+
+	// Get expired records that haven't been processed yet
+	expiredRecords, err := dynamo.GetExpired(false)
+	if err != nil {
+		return fmt.Errorf("failed to get expired records: %v", err)
+	}
+
+	if len(expiredRecords) == 0 {
+		fmt.Printf("✅ No expired sessions found\n")
+		return nil
+	}
+
+	fmt.Printf("🔍 Found %d expired sessions to process\n", len(expiredRecords))
+
+	var successCount, errorCount int
+
+	for i, record := range expiredRecords {
+		fmt.Printf("\n--- Processing expired record %d/%d ---\n", i+1, len(expiredRecords))
+		fmt.Printf("📋 RequestID: %s\n", record.RequestID)
+		fmt.Printf("👤 User: %s\n", record.Requester)
+		fmt.Printf("🏦 Account: %s\n", record.AccountID)
+		fmt.Printf("✅ Approver: %s\n", record.Approver)
+		fmt.Printf("⏰ Expired at: %s\n", time.Unix(int64(record.ExpirationTimestamp), 0).Format(time.RFC3339))
+
+		// Remove permission set from Identity Center
+		err := identityCenterRemovePermissionSetWithApprover(
+			record.Requester, 
+			record.AccountID, 
+			"AdministratorAccess", 
+			record.Approver, 
+			region,
+		)
+		if err != nil {
+			fmt.Printf("❌ Error removing permission set for %s: %v\n", record.Requester, err)
+			errorCount++
+			continue
+		}
+
+		// Mark record as expired in DynamoDB
+		err = dynamo.UpdateItemStatus(record.RequestID, record.CreatedTimestamp, dynamodb.Expired)
+		if err != nil {
+			fmt.Printf("❌ Error updating record status to Expired: %v\n", err)
+			errorCount++
+			continue
+		}
+
+		successCount++
+		fmt.Printf("✅ Successfully removed access for %s from account %s\n", record.Requester, record.AccountID)
+		
+		// Send notification email about access removal
+		emailErr := sendEmailNotification(
+			record.Requester, 
+			"EXPIRED", 
+			"Your temporary access has expired and been automatically removed", 
+			record.AccountID, 
+			region,
+		)
+		if emailErr != nil {
+			fmt.Printf("⚠️ Failed to send expiration email to %s: %v\n", record.Requester, emailErr)
+		}
+	}
+
+	fmt.Printf("\n📊 === CLEANUP SUMMARY ===\n")
+	fmt.Printf("✅ Successfully processed: %d\n", successCount)
+	fmt.Printf("❌ Errors encountered: %d\n", errorCount)
+	fmt.Printf("📧 Total records processed: %d\n", len(expiredRecords))
+
+	if errorCount > 0 {
+		return fmt.Errorf("completed with %d errors out of %d records", errorCount, len(expiredRecords))
+	}
+
+	return nil
+}
+
 func main() {
 	fmt.Println("=== Main Function Started ===")
 
@@ -317,8 +506,8 @@ func main() {
 	fmt.Printf("AWS_LAMBDA_FUNCTION_NAME: '%s'\n", lambdaFunctionName)
 
 	if lambdaFunctionName != "" {
-		fmt.Println("✅ Detected Lambda environment - Starting Lambda handler...")
-		lambda.Start(lambdaHandler)
+		fmt.Println("✅ Detected Lambda environment - Starting universal handler...")
+		lambda.Start(universalHandler)
 		return
 	}
 
