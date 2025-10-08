@@ -7,22 +7,29 @@ import (
 	"os"
 	"pim-manager/pkg/dynamodb"
 	"pim-manager/pkg/identitycenter"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/secretsmanager"
+	"github.com/aws/aws-sdk-go/service/ses"
 	"github.com/google/uuid"
 )
 
 var (
-	expiration    dynamodb.Timestamp = 60 // 1 minute
-	Region        string
-	DynamoDbTable string
+	expiration        dynamodb.Timestamp = 60 // 1 minute
+	Region            string
+	DynamoDbTable     string
+	ApproversSecret   string
+	ManagementAccount string
 )
 
 func init() {
 	fmt.Println("=== Lambda Function Initialization ===")
-
+	
 	Region = os.Getenv("AWS_REGION")
 	fmt.Printf("AWS_REGION environment variable: '%s'\n", Region)
 	if Region == "" {
@@ -39,6 +46,22 @@ func init() {
 	}
 	fmt.Printf("✅ DYNAMO_TABLE set to: %s\n", DynamoDbTable)
 
+	ApproversSecret = os.Getenv("APPROVERS")
+	fmt.Printf("APPROVERS environment variable: '%s'\n", ApproversSecret)
+	if ApproversSecret == "" {
+		fmt.Println("ERROR: APPROVERS secret name is not set!")
+		panic(fmt.Errorf("APPROVERS is not set!"))
+	}
+	fmt.Printf("✅ APPROVERS secret set to: %s\n", ApproversSecret)
+
+	ManagementAccount = os.Getenv("MANAGEMENT_ACCOUNT")
+	fmt.Printf("MANAGEMENT_ACCOUNT environment variable: '%s'\n", ManagementAccount)
+	if ManagementAccount == "" {
+		fmt.Println("ERROR: MANAGEMENT_ACCOUNT is not set!")
+		panic(fmt.Errorf("MANAGEMENT_ACCOUNT is not set!"))
+	}
+	fmt.Printf("✅ MANAGEMENT_ACCOUNT set to: %s\n", ManagementAccount)
+	
 	fmt.Println("=== Lambda Function Initialization Complete ===")
 }
 
@@ -48,6 +71,135 @@ type SQSMessage struct {
 	Approver  string `json:"approver"`
 	Account   string `json:"account"`
 	Datetime  string `json:"datetime"`
+}
+
+// getApproversFromSecret fetches the list of approved users from AWS Secrets Manager
+func getApproversFromSecret(secretName, region string) ([]string, error) {
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String(region),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AWS session: %v", err)
+	}
+
+	svc := secretsmanager.New(sess)
+	input := &secretsmanager.GetSecretValueInput{
+		SecretId: aws.String(secretName),
+	}
+
+	result, err := svc.GetSecretValue(input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get secret value: %v", err)
+	}
+
+	var approvers []string
+	err = json.Unmarshal([]byte(*result.SecretString), &approvers)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse approvers list: %v", err)
+	}
+
+	return approvers, nil
+}
+
+// validateApprover checks if the approver is in the allowed list
+func validateApproverFromSecret(approver, secretName, region string) error {
+	fmt.Printf("🔍 Validating approver '%s' against secret '%s'\n", approver, secretName)
+	
+	approvers, err := getApproversFromSecret(secretName, region)
+	if err != nil {
+		return fmt.Errorf("failed to fetch approvers: %v", err)
+	}
+
+	fmt.Printf("📋 Found %d approved users in secret\n", len(approvers))
+	
+	// Check if approver is in the list (case-insensitive)
+	for _, validApprover := range approvers {
+		if strings.EqualFold(strings.TrimSpace(validApprover), strings.TrimSpace(approver)) {
+			fmt.Printf("✅ Approver '%s' is authorized\n", approver)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("approver '%s' is not in the authorized approvers list", approver)
+}
+
+// validateNotManagementAccount checks if the request is for management account
+func validateNotManagementAccount(accountID, managementAccount string) error {
+	if strings.TrimSpace(accountID) == strings.TrimSpace(managementAccount) {
+		return fmt.Errorf("access to management account '%s' is not allowed", managementAccount)
+	}
+	return nil
+}
+
+// sendEmailNotification sends email notification to the requestor
+func sendEmailNotification(requestor, status, reason, account, region string) error {
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String(region),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create AWS session for SES: %v", err)
+	}
+
+	svc := ses.New(sess)
+	
+	var subject, body string
+	if status == "APPROVED" {
+		subject = fmt.Sprintf("✅ PIM Request Approved - Account %s", account)
+		body = fmt.Sprintf(`
+Your Privileged Identity Management (PIM) request has been APPROVED.
+
+Details:
+- Account: %s
+- Permission Set: AdministratorAccess
+- Duration: 1 hour
+- Status: %s
+
+You should now have access to the requested AWS account.
+
+This is an automated notification from the PIM system.
+		`, account, status)
+	} else {
+		subject = fmt.Sprintf("❌ PIM Request Rejected - Account %s", account)
+		body = fmt.Sprintf(`
+Your Privileged Identity Management (PIM) request has been REJECTED.
+
+Details:
+- Account: %s
+- Status: %s
+- Reason: %s
+
+Please contact your administrator if you believe this is an error.
+
+This is an automated notification from the PIM system.
+		`, account, status, reason)
+	}
+
+	input := &ses.SendEmailInput{
+		Destination: &ses.Destination{
+			ToAddresses: []*string{aws.String(requestor)},
+		},
+		Message: &ses.Message{
+			Body: &ses.Body{
+				Text: &ses.Content{
+					Charset: aws.String("UTF-8"),
+					Data:    aws.String(body),
+				},
+			},
+			Subject: &ses.Content{
+				Charset: aws.String("UTF-8"),
+				Data:    aws.String(subject),
+			},
+		},
+		Source: aws.String("noreply@popai.health"), // Change to your verified SES email
+	}
+
+	_, err = svc.SendEmail(input)
+	if err != nil {
+		return fmt.Errorf("failed to send email: %v", err)
+	}
+
+	fmt.Printf("📧 Email notification sent to %s (Status: %s)\n", requestor, status)
+	return nil
 }
 
 // lambdaHandler handles SQS events from AWS Lambda
@@ -85,27 +237,57 @@ func lambdaHandler(ctx context.Context, sqsEvent events.SQSEvent) error {
 		// Process the access request
 		fmt.Printf("\n🚀 === PROCESSING ACCESS REQUEST ===\n")
 		
-		// Create DynamoDB request object
-		pimRequest := dynamodb.DynamoDbPimRequests{
-			Requester: message.Requestor,
-			Approver:  message.Approver,
-			AccountID: message.Account,
-		}
+		var rejectionReason string
+		var success bool = false
 		
-		// Assign Administration permission set
-		permissionSet := "AdministratorAccess"
-		fmt.Printf("🔑 Assigning permission set '%s' to user '%s' for account '%s'\n", 
-			permissionSet, message.Requestor, message.Account)
-		
-		err := sqsAssignPermissionSet(DynamoDbTable, pimRequest, permissionSet, Region)
+		// 1. Validate approver is authorized
+		err := validateApproverFromSecret(message.Approver, ApproversSecret, Region)
 		if err != nil {
-			fmt.Printf("❌ Error assigning permission set: %v\n", err)
-			// Continue processing other messages instead of failing completely
-			continue
+			rejectionReason = fmt.Sprintf("Unauthorized approver: %v", err)
+			fmt.Printf("❌ %s\n", rejectionReason)
+		} else {
+			// 2. Validate not requesting management account
+			err = validateNotManagementAccount(message.Account, ManagementAccount)
+			if err != nil {
+				rejectionReason = fmt.Sprintf("Management account protection: %v", err)
+				fmt.Printf("❌ %s\n", rejectionReason)
+			} else {
+				// 3. All validations passed - proceed with assignment
+				pimRequest := dynamodb.DynamoDbPimRequests{
+					Requester: message.Requestor,
+					Approver:  message.Approver,
+					AccountID: message.Account,
+				}
+				
+				permissionSet := "AdministratorAccess"
+				fmt.Printf("🔑 Assigning permission set '%s' to user '%s' for account '%s'\n", 
+					permissionSet, message.Requestor, message.Account)
+				
+				err = sqsAssignPermissionSet(DynamoDbTable, pimRequest, permissionSet, Region)
+				if err != nil {
+					rejectionReason = fmt.Sprintf("Permission assignment failed: %v", err)
+					fmt.Printf("❌ %s\n", rejectionReason)
+				} else {
+					success = true
+					fmt.Printf("✅ Successfully assigned Administration access to %s for account %s\n", 
+						message.Requestor, message.Account)
+				}
+			}
 		}
 		
-		fmt.Printf("✅ Successfully assigned Administration access to %s for account %s\n", 
-			message.Requestor, message.Account)
+		// 4. Send email notification
+		var status string
+		if success {
+			status = "APPROVED"
+			rejectionReason = "" // Clear reason for approved requests
+		} else {
+			status = "REJECTED"
+		}
+		
+		emailErr := sendEmailNotification(message.Requestor, status, rejectionReason, message.Account, Region)
+		if emailErr != nil {
+			fmt.Printf("⚠️ Failed to send email notification: %v\n", emailErr)
+		}
 		
 		// Print message attributes if any
 		if len(record.MessageAttributes) > 0 {
