@@ -18,64 +18,98 @@ var (
 	expiration    dynamodb.Timestamp = 60 // 1 minute
 	Region        string
 	DynamoDbTable string
-
-	// Test SQS event for local testing
-	testSQSEvent = events.SQSEvent{
-		Records: []events.SQSMessage{
-			{
-				MessageId:     "19dd0b57-b21e-4ac1-bd88-01bbb068cb78",
-				ReceiptHandle: "MessageReceiptHandle",
-				Body:          "Hello from SQS!",
-				Attributes: map[string]string{
-					"ApproximateReceiveCount":          "1",
-					"SentTimestamp":                    "1523232000000",
-					"SenderId":                         "123456789012",
-					"ApproximateFirstReceiveTimestamp": "1523232000001",
-				},
-				MessageAttributes: map[string]events.SQSMessageAttribute{},
-				Md5OfBody:         "{{{md5_of_body}}}",
-				EventSource:       "aws:sqs",
-				EventSourceARN:    "arn:aws:sqs:us-east-1:123456789012:MyQueue",
-				AWSRegion:         "us-east-1",
-			},
-		},
-	}
 )
 
 func init() {
+	fmt.Println("=== Lambda Function Initialization ===")
+
 	Region = os.Getenv("AWS_REGION")
+	fmt.Printf("AWS_REGION environment variable: '%s'\n", Region)
 	if Region == "" {
+		fmt.Println("ERROR: AWS_REGION is not set!")
 		panic(fmt.Errorf("AWS_REGION is not set!"))
 	}
+	fmt.Printf("✅ AWS_REGION set to: %s\n", Region)
 
 	DynamoDbTable = os.Getenv("DYNAMO_TABLE")
+	fmt.Printf("DYNAMO_TABLE environment variable: '%s'\n", DynamoDbTable)
 	if DynamoDbTable == "" {
+		fmt.Println("ERROR: DynamoDbTable is not set!")
 		panic(fmt.Errorf("DynamoDbTable is not set!"))
 	}
+	fmt.Printf("✅ DYNAMO_TABLE set to: %s\n", DynamoDbTable)
+
+	fmt.Println("=== Lambda Function Initialization Complete ===")
+}
+
+// SQSMessage represents the expected structure of SQS message body
+type SQSMessage struct {
+	Requestor string `json:"requestor"`
+	Approver  string `json:"approver"`
+	Account   string `json:"account"`
+	Datetime  string `json:"datetime"`
 }
 
 // lambdaHandler handles SQS events from AWS Lambda
 func lambdaHandler(ctx context.Context, sqsEvent events.SQSEvent) error {
-	fmt.Printf("Received SQS event with %d records\n", len(sqsEvent.Records))
-	
+	fmt.Printf("🔔 Received SQS event with %d records\n", len(sqsEvent.Records))
+
 	for i, record := range sqsEvent.Records {
-		fmt.Printf("=== SQS Record %d/%d ===\n", i+1, len(sqsEvent.Records))
-		fmt.Printf("MessageId: %s\n", record.MessageId)
-		fmt.Printf("EventSource: %s\n", record.EventSource)
-		fmt.Printf("EventSourceARN: %s\n", record.EventSourceARN)
-		fmt.Printf("ReceiptHandle: %s\n", record.ReceiptHandle)
-		fmt.Printf("Body: %s\n", record.Body)
-		
-		// Pretty print the message body if it's JSON
-		var prettyJSON map[string]interface{}
-		if err := json.Unmarshal([]byte(record.Body), &prettyJSON); err == nil {
-			prettyBytes, _ := json.MarshalIndent(prettyJSON, "", "  ")
-			fmt.Printf("Parsed JSON Body:\n%s\n", string(prettyBytes))
+		fmt.Printf("\n=== Processing SQS Record %d/%d ===\n", i+1, len(sqsEvent.Records))
+		fmt.Printf("📝 MessageId: %s\n", record.MessageId)
+		fmt.Printf("📋 EventSource: %s\n", record.EventSource)
+		fmt.Printf("🔗 EventSourceARN: %s\n", record.EventSourceARN)
+		fmt.Printf("📄 Raw Body: %s\n", record.Body)
+
+		// Parse the SQS message body
+		var message SQSMessage
+		if err := json.Unmarshal([]byte(record.Body), &message); err != nil {
+			fmt.Printf("❌ Error parsing SQS message body: %v\n", err)
+			fmt.Printf("📄 Raw body that failed to parse: %s\n", record.Body)
+			continue
 		}
+
+		// Log the extracted information
+		fmt.Printf("\n🎯 === ACCESS REQUEST DETAILS ===\n")
+		fmt.Printf("👤 Requestor: %s\n", message.Requestor)
+		fmt.Printf("✅ Approver: %s\n", message.Approver)
+		fmt.Printf("🏦 AWS Account: %s\n", message.Account)
+		fmt.Printf("⏰ Request Time: %s\n", message.Datetime)
+		fmt.Printf("🔐 Action: Grant Administration access to account %s for user %s (approved by %s)\n", 
+			message.Account, message.Requestor, message.Approver)
+		
+		// Pretty print the entire message for debugging
+		prettyBytes, _ := json.MarshalIndent(message, "", "  ")
+		fmt.Printf("\n📊 Structured Message Data:\n%s\n", string(prettyBytes))
+		
+		// Process the access request
+		fmt.Printf("\n🚀 === PROCESSING ACCESS REQUEST ===\n")
+		
+		// Create DynamoDB request object
+		pimRequest := dynamodb.DynamoDbPimRequests{
+			Requester: message.Requestor,
+			Approver:  message.Approver,
+			AccountID: message.Account,
+		}
+		
+		// Assign Administration permission set
+		permissionSet := "AdministratorAccess"
+		fmt.Printf("🔑 Assigning permission set '%s' to user '%s' for account '%s'\n", 
+			permissionSet, message.Requestor, message.Account)
+		
+		err := sqsAssignPermissionSet(DynamoDbTable, pimRequest, permissionSet, Region)
+		if err != nil {
+			fmt.Printf("❌ Error assigning permission set: %v\n", err)
+			// Continue processing other messages instead of failing completely
+			continue
+		}
+		
+		fmt.Printf("✅ Successfully assigned Administration access to %s for account %s\n", 
+			message.Requestor, message.Account)
 		
 		// Print message attributes if any
 		if len(record.MessageAttributes) > 0 {
-			fmt.Println("Message Attributes:")
+			fmt.Println("\n📎 Message Attributes:")
 			for key, attr := range record.MessageAttributes {
 				var value, dataType string
 				if attr.StringValue != nil {
@@ -86,35 +120,28 @@ func lambdaHandler(ctx context.Context, sqsEvent events.SQSEvent) error {
 			}
 		}
 		
-		fmt.Printf("Attributes: %+v\n", record.Attributes)
 		fmt.Println("========================")
 	}
-	
+
+	fmt.Printf("✅ Successfully processed %d SQS records\n", len(sqsEvent.Records))
 	return nil
 }
 
 func main() {
+	fmt.Println("=== Main Function Started ===")
+
 	// Check if running in Lambda environment
-	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
-		fmt.Println("Starting Lambda handler...")
+	lambdaFunctionName := os.Getenv("AWS_LAMBDA_FUNCTION_NAME")
+	fmt.Printf("AWS_LAMBDA_FUNCTION_NAME: '%s'\n", lambdaFunctionName)
+
+	if lambdaFunctionName != "" {
+		fmt.Println("✅ Detected Lambda environment - Starting Lambda handler...")
 		lambda.Start(lambdaHandler)
 		return
 	}
 
-	// Local development/testing mode
-	fmt.Println("Running in local mode...")
-	
-	// Test the Lambda handler with test SQS event
-	fmt.Println("Testing Lambda handler with test SQS event...")
-	err := lambdaHandler(context.Background(), testSQSEvent)
-	if err != nil {
-		fmt.Printf("Error in Lambda handler: %v\n", err)
-		panic(err)
-	}
-	fmt.Println("Lambda handler test completed successfully!")
-	
 	// Run the existing expired sessions check
-	err = sqsCheckExpiredSessions(DynamoDbTable, Region)
+	err := sqsCheckExpiredSessions(DynamoDbTable, Region)
 	if err != nil {
 		fmt.Printf("Error checking expired sessions: %v\n", err)
 		panic(err)
