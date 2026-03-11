@@ -26,66 +26,103 @@ var (
 	DynamoDbTable     string
 	ApproversSecret   string
 	ManagementAccount string
+	PermissionSet     string
+	// LogLevel controls verbosity. Accepted values: "debug", "info" (default).
+	// Set LOG_LEVEL=debug to include PII such as email addresses, account IDs,
+	// and raw SQS message bodies in CloudWatch logs.
+	LogLevel string
 )
 
+// isDebug returns true when debug-level logging is enabled.
+func isDebug() bool {
+	return strings.EqualFold(LogLevel, "debug")
+}
+
+func logDebug(format string, args ...interface{}) {
+	if isDebug() {
+		fmt.Printf("[DEBUG] "+format, args...)
+	}
+}
+
+func logInfo(format string, args ...interface{}) {
+	fmt.Printf("[INFO] "+format, args...)
+}
+
+func logWarn(format string, args ...interface{}) {
+	fmt.Printf("[WARN] "+format, args...)
+}
+
+func logError(format string, args ...interface{}) {
+	fmt.Printf("[ERROR] "+format, args...)
+}
+
 func init() {
-	fmt.Println("=== Lambda Function Initialization ===")
-	
+	// Read LogLevel first so every subsequent log call respects it.
+	LogLevel = strings.ToLower(strings.TrimSpace(os.Getenv("LOG_LEVEL")))
+	if LogLevel == "" {
+		LogLevel = "info"
+	}
+
+	logInfo("=== Lambda Function Initialization (log_level=%s) ===\n", LogLevel)
+
 	Region = os.Getenv("AWS_REGION")
-	fmt.Printf("AWS_REGION environment variable: '%s'\n", Region)
+	logDebug("AWS_REGION: '%s'\n", Region)
 	if Region == "" {
-		fmt.Println("ERROR: AWS_REGION is not set!")
+		logError("AWS_REGION is not set\n")
 		panic(fmt.Errorf("AWS_REGION is not set!"))
 	}
-	fmt.Printf("✅ AWS_REGION set to: %s\n", Region)
 
 	DynamoDbTable = os.Getenv("DYNAMO_TABLE")
-	fmt.Printf("DYNAMO_TABLE environment variable: '%s'\n", DynamoDbTable)
+	logDebug("DYNAMO_TABLE: '%s'\n", DynamoDbTable)
 	if DynamoDbTable == "" {
-		fmt.Println("ERROR: DynamoDbTable is not set!")
+		logError("DYNAMO_TABLE is not set\n")
 		panic(fmt.Errorf("DynamoDbTable is not set!"))
 	}
-	fmt.Printf("✅ DYNAMO_TABLE set to: %s\n", DynamoDbTable)
 
 	ApproversSecret = os.Getenv("APPROVERS")
-	fmt.Printf("APPROVERS environment variable: '%s'\n", ApproversSecret)
+	logDebug("APPROVERS secret name: '%s'\n", ApproversSecret)
 	if ApproversSecret == "" {
-		fmt.Println("ERROR: APPROVERS secret name is not set!")
+		logError("APPROVERS secret name is not set\n")
 		panic(fmt.Errorf("APPROVERS is not set!"))
 	}
-	fmt.Printf("✅ APPROVERS secret set to: %s\n", ApproversSecret)
 
 	ManagementAccount = os.Getenv("MANAGEMENT_ACCOUNT")
-	fmt.Printf("MANAGEMENT_ACCOUNT environment variable: '%s'\n", ManagementAccount)
+	logDebug("MANAGEMENT_ACCOUNT configured\n")
 	if ManagementAccount == "" {
-		fmt.Println("ERROR: MANAGEMENT_ACCOUNT is not set!")
+		logError("MANAGEMENT_ACCOUNT is not set\n")
 		panic(fmt.Errorf("MANAGEMENT_ACCOUNT is not set!"))
 	}
-	fmt.Printf("✅ MANAGEMENT_ACCOUNT set to: %s\n", ManagementAccount)
 
 	sessionTimeoutStr := os.Getenv("SESSION_TIMEOUT")
-	fmt.Printf("SESSION_TIMEOUT environment variable: '%s'\n", sessionTimeoutStr)
+	logDebug("SESSION_TIMEOUT raw value: '%s'\n", sessionTimeoutStr)
 	if sessionTimeoutStr == "" {
-		fmt.Println("WARNING: SESSION_TIMEOUT is not set, using default 3600 seconds (1 hour)")
-		expiration = 3600 // Default to 1 hour
+		logWarn("SESSION_TIMEOUT is not set, using default 3600 seconds (1 hour)\n")
+		expiration = 3600
 	} else {
 		timeoutSeconds, err := strconv.ParseInt(sessionTimeoutStr, 10, 64)
 		if err != nil {
-			fmt.Printf("ERROR: SESSION_TIMEOUT is not a valid number: %v\n", err)
+			logError("SESSION_TIMEOUT is not a valid number: %v\n", err)
 			panic(fmt.Errorf("SESSION_TIMEOUT must be a valid number of seconds"))
 		}
 		if timeoutSeconds <= 0 {
-			fmt.Printf("ERROR: SESSION_TIMEOUT must be positive, got: %d\n", timeoutSeconds)
+			logError("SESSION_TIMEOUT must be positive, got: %d\n", timeoutSeconds)
 			panic(fmt.Errorf("SESSION_TIMEOUT must be positive"))
 		}
 		expiration = dynamodb.Timestamp(timeoutSeconds)
 	}
-	fmt.Printf("✅ SESSION_TIMEOUT set to: %d seconds (%s)\n", expiration, formatDuration(int64(expiration)))
-	
-	fmt.Println("=== Lambda Function Initialization Complete ===")
+
+	PermissionSet = os.Getenv("PIM_ROLE")
+	if PermissionSet == "" {
+		PermissionSet = "AdministratorAccess"
+		logInfo("PIM_ROLE not set, using default: %s\n", PermissionSet)
+	} else {
+		logInfo("PIM_ROLE set to: %s\n", PermissionSet)
+	}
+
+	logInfo("=== Lambda Function Initialized (region=%s, timeout=%s) ===\n", Region, formatDuration(int64(expiration)))
 }
 
-// formatDuration converts seconds to human-readable format
+// formatDuration converts seconds to human-readable format.
 func formatDuration(seconds int64) string {
 	if seconds < 60 {
 		return fmt.Sprintf("%d seconds", seconds)
@@ -106,7 +143,7 @@ func formatDuration(seconds int64) string {
 	}
 }
 
-// SQSMessage represents the expected structure of SQS message body
+// SQSMessage represents the expected structure of SQS message body.
 type SQSMessage struct {
 	Requestor string `json:"requestor"`
 	Approver  string `json:"approver"`
@@ -114,7 +151,7 @@ type SQSMessage struct {
 	Datetime  string `json:"datetime"`
 }
 
-// getApproversFromSecret fetches the list of approved users from AWS Secrets Manager
+// getApproversFromSecret fetches the list of approved users from AWS Secrets Manager.
 func getApproversFromSecret(secretName, region string) ([]string, error) {
 	sess, err := session.NewSession(&aws.Config{
 		Region: aws.String(region),
@@ -142,21 +179,20 @@ func getApproversFromSecret(secretName, region string) ([]string, error) {
 	return approvers, nil
 }
 
-// validateApprover checks if the approver is in the allowed list
+// validateApproverFromSecret checks if the approver is in the allowed list stored in Secrets Manager.
 func validateApproverFromSecret(approver, secretName, region string) error {
-	fmt.Printf("🔍 Validating approver '%s' against secret '%s'\n", approver, secretName)
-	
+	logDebug("Validating approver '%s' against secret '%s'\n", approver, secretName)
+
 	approvers, err := getApproversFromSecret(secretName, region)
 	if err != nil {
 		return fmt.Errorf("failed to fetch approvers: %v", err)
 	}
 
-	fmt.Printf("📋 Found %d approved users in secret\n", len(approvers))
-	
-	// Check if approver is in the list (case-insensitive)
+	logDebug("Found %d approved users in secret\n", len(approvers))
+
 	for _, validApprover := range approvers {
 		if strings.EqualFold(strings.TrimSpace(validApprover), strings.TrimSpace(approver)) {
-			fmt.Printf("✅ Approver '%s' is authorized\n", approver)
+			logDebug("Approver '%s' is authorized\n", approver)
 			return nil
 		}
 	}
@@ -164,15 +200,15 @@ func validateApproverFromSecret(approver, secretName, region string) error {
 	return fmt.Errorf("approver '%s' is not in the authorized approvers list", approver)
 }
 
-// validateNotManagementAccount checks if the request is for management account
+// validateNotManagementAccount checks if the request is for management account.
 func validateNotManagementAccount(accountID, managementAccount string) error {
 	if strings.TrimSpace(accountID) == strings.TrimSpace(managementAccount) {
-		return fmt.Errorf("access to management account '%s' is not allowed", managementAccount)
+		return fmt.Errorf("access to management account is not allowed")
 	}
 	return nil
 }
 
-// sendEmailNotification sends email notification to the requestor
+// sendEmailNotification sends email notification to the requestor.
 func sendEmailNotification(requestor, status, reason, account, region string) error {
 	sess, err := session.NewSession(&aws.Config{
 		Region: aws.String(region),
@@ -182,7 +218,7 @@ func sendEmailNotification(requestor, status, reason, account, region string) er
 	}
 
 	svc := ses.New(sess)
-	
+
 	var subject, body string
 	switch status {
 	case "APPROVED":
@@ -192,14 +228,14 @@ Your Privileged Identity Management (PIM) request has been APPROVED.
 
 Details:
 - Account: %s
-- Permission Set: AdministratorAccess
+- Permission Set: %s
 - Duration: 1 hour
 - Status: %s
 
 You should now have access to the requested AWS account.
 
 This is an automated notification from the PIM system.
-		`, account, status)
+		`, account, PermissionSet, status)
 	case "EXPIRED":
 		subject = fmt.Sprintf("⏰ PIM Access Expired - Account %s", account)
 		body = fmt.Sprintf(`
@@ -207,14 +243,14 @@ Your Privileged Identity Management (PIM) access has EXPIRED and been automatica
 
 Details:
 - Account: %s
-- Permission Set: AdministratorAccess
+- Permission Set: %s
 - Status: %s
 - Reason: %s
 
 Your temporary access has been revoked. If you need continued access, please submit a new request.
 
 This is an automated notification from the PIM system.
-		`, account, status, reason)
+		`, account, PermissionSet, status, reason)
 	default: // REJECTED
 		subject = fmt.Sprintf("❌ PIM Request Rejected - Account %s", account)
 		body = fmt.Sprintf(`
@@ -255,241 +291,218 @@ This is an automated notification from the PIM system.
 		return fmt.Errorf("failed to send email: %v", err)
 	}
 
-	fmt.Printf("📧 Email notification sent to %s (Status: %s)\n", requestor, status)
+	// Email address is PII — keep recipient out of INFO logs.
+	logDebug("Email notification sent to '%s' (status=%s)\n", requestor, status)
 	return nil
 }
 
-// universalHandler handles both SQS and EventBridge events
+// universalHandler handles both SQS and EventBridge events.
 func universalHandler(ctx context.Context, event interface{}) error {
-	fmt.Printf("🔔 Received Lambda event\n")
-	
-	// Try to determine event type by checking the event structure
+	logInfo("Received Lambda event\n")
+
 	eventBytes, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("failed to marshal event: %v", err)
 	}
-	
-	// Check if it's an SQS event
+
+	// Check if it's an SQS event.
 	var sqsEvent events.SQSEvent
 	if err := json.Unmarshal(eventBytes, &sqsEvent); err == nil && len(sqsEvent.Records) > 0 {
-		// Check if first record has SQS-specific fields
 		if sqsEvent.Records[0].EventSource == "aws:sqs" {
-			fmt.Printf("📋 Detected SQS event with %d records\n", len(sqsEvent.Records))
+			logInfo("Detected SQS event with %d records\n", len(sqsEvent.Records))
 			return handleSQSEvent(ctx, sqsEvent)
 		}
 	}
-	
-	// Check if it's an EventBridge event
+
+	// Check if it's an EventBridge event.
 	var eventBridgeEvent events.CloudWatchEvent
 	if err := json.Unmarshal(eventBytes, &eventBridgeEvent); err == nil && eventBridgeEvent.Source != "" {
-		fmt.Printf("⏰ Detected EventBridge scheduled event\n")
+		logInfo("Detected EventBridge scheduled event\n")
 		return handleScheduledEvent(ctx, eventBridgeEvent)
 	}
-	
-	// If we can't determine the event type, log the raw event
-	fmt.Printf("❓ Unknown event type received: %s\n", string(eventBytes))
+
+	// Raw event payload may contain PII — only emit under debug.
+	logDebug("Unknown event type received: %s\n", string(eventBytes))
+	logError("Unsupported event type\n")
 	return fmt.Errorf("unsupported event type")
 }
 
-// handleSQSEvent processes SQS messages for permission assignment
+// handleSQSEvent processes SQS messages for permission assignment.
 func handleSQSEvent(ctx context.Context, sqsEvent events.SQSEvent) error {
-	fmt.Printf("🔔 Received SQS event with %d records\n", len(sqsEvent.Records))
+	logInfo("Processing %d SQS record(s)\n", len(sqsEvent.Records))
 
 	for i, record := range sqsEvent.Records {
-		fmt.Printf("\n=== Processing SQS Record %d/%d ===\n", i+1, len(sqsEvent.Records))
-		fmt.Printf("📝 MessageId: %s\n", record.MessageId)
-		fmt.Printf("📋 EventSource: %s\n", record.EventSource)
-		fmt.Printf("🔗 EventSourceARN: %s\n", record.EventSourceARN)
-		fmt.Printf("📄 Raw Body: %s\n", record.Body)
+		logInfo("Processing record %d/%d (messageId=%s)\n", i+1, len(sqsEvent.Records), record.MessageId)
+		// Raw body and routing metadata contain PII — debug only.
+		logDebug("EventSource=%s EventSourceARN=%s\n", record.EventSource, record.EventSourceARN)
+		logDebug("Raw body: %s\n", record.Body)
 
-		// Parse the SQS message body
 		var message SQSMessage
 		if err := json.Unmarshal([]byte(record.Body), &message); err != nil {
-			fmt.Printf("❌ Error parsing SQS message body: %v\n", err)
-			fmt.Printf("📄 Raw body that failed to parse: %s\n", record.Body)
+			logError("Failed to parse SQS message body (messageId=%s): %v\n", record.MessageId, err)
+			logDebug("Raw body that failed to parse: %s\n", record.Body)
 			continue
 		}
 
-		// Log the extracted information
-		fmt.Printf("\n🎯 === ACCESS REQUEST DETAILS ===\n")
-		fmt.Printf("👤 Requestor: %s\n", message.Requestor)
-		fmt.Printf("✅ Approver: %s\n", message.Approver)
-		fmt.Printf("🏦 AWS Account: %s\n", message.Account)
-		fmt.Printf("⏰ Request Time: %s\n", message.Datetime)
-		fmt.Printf("🔐 Action: Grant Administration access to account %s for user %s (approved by %s)\n", 
-			message.Account, message.Requestor, message.Approver)
-		
-		// Pretty print the entire message for debugging
-		prettyBytes, _ := json.MarshalIndent(message, "", "  ")
-		fmt.Printf("\n📊 Structured Message Data:\n%s\n", string(prettyBytes))
-		
-		// Process the access request
-		fmt.Printf("\n🚀 === PROCESSING ACCESS REQUEST ===\n")
-		
+		// All fields contain PII or account metadata — debug only.
+		logDebug("Requestor=%s Approver=%s Account=%s Datetime=%s\n",
+			message.Requestor, message.Approver, message.Account, message.Datetime)
+		if isDebug() {
+			prettyBytes, _ := json.MarshalIndent(message, "", "  ")
+			logDebug("Structured message:\n%s\n", string(prettyBytes))
+		}
+
 		var rejectionReason string
-		var success bool = false
-		
-		// 1. Validate approver is authorized
+		var success bool
+
+		// 1. Validate approver is authorized.
 		err := validateApproverFromSecret(message.Approver, ApproversSecret, Region)
 		if err != nil {
 			rejectionReason = fmt.Sprintf("Unauthorized approver: %v", err)
-			fmt.Printf("❌ %s\n", rejectionReason)
+			logInfo("Request rejected (messageId=%s): unauthorized approver\n", record.MessageId)
+			logDebug("Rejection detail: %s\n", rejectionReason)
 		} else {
-			// 2. Validate not requesting management account
+			// 2. Validate not requesting management account.
 			err = validateNotManagementAccount(message.Account, ManagementAccount)
 			if err != nil {
 				rejectionReason = fmt.Sprintf("Management account protection: %v", err)
-				fmt.Printf("❌ %s\n", rejectionReason)
+				logInfo("Request rejected (messageId=%s): management account protection\n", record.MessageId)
+				logDebug("Rejection detail: %s\n", rejectionReason)
 			} else {
-				// 3. All validations passed - proceed with assignment
+				// 3. All validations passed — proceed with assignment.
 				pimRequest := dynamodb.DynamoDbPimRequests{
 					Requester: message.Requestor,
 					Approver:  message.Approver,
 					AccountID: message.Account,
 				}
-				
-				permissionSet := "AdministratorAccess"
-				fmt.Printf("🔑 Assigning permission set '%s' to user '%s' for account '%s'\n", 
-					permissionSet, message.Requestor, message.Account)
-				
+
+				permissionSet := PermissionSet
+				logDebug("Assigning permission set '%s' to requestor for account (messageId=%s)\n",
+					permissionSet, record.MessageId)
+
 				err = sqsAssignPermissionSet(DynamoDbTable, pimRequest, permissionSet, Region)
 				if err != nil {
 					rejectionReason = fmt.Sprintf("Permission assignment failed: %v", err)
-					fmt.Printf("❌ %s\n", rejectionReason)
+					logInfo("Request failed (messageId=%s): permission assignment error\n", record.MessageId)
+					logDebug("Error detail: %s\n", rejectionReason)
 				} else {
 					success = true
-					fmt.Printf("✅ Successfully assigned Administration access to %s for account %s\n", 
-						message.Requestor, message.Account)
+					logInfo("Access granted (messageId=%s)\n", record.MessageId)
 				}
 			}
 		}
-		
-		// 4. Send email notification
+
+		// 4. Send email notification.
 		var status string
 		if success {
 			status = "APPROVED"
-			rejectionReason = "" // Clear reason for approved requests
+			rejectionReason = ""
 		} else {
 			status = "REJECTED"
 		}
-		
+
 		emailErr := sendEmailNotification(message.Requestor, status, rejectionReason, message.Account, Region)
 		if emailErr != nil {
-			fmt.Printf("⚠️ Failed to send email notification: %v\n", emailErr)
+			logWarn("Failed to send email notification (messageId=%s): %v\n", record.MessageId, emailErr)
 		}
-		
-		// Print message attributes if any
+
 		if len(record.MessageAttributes) > 0 {
-			fmt.Println("\n📎 Message Attributes:")
+			logDebug("Message has %d attribute(s)\n", len(record.MessageAttributes))
 			for key, attr := range record.MessageAttributes {
-				var value, dataType string
+				var value string
 				if attr.StringValue != nil {
 					value = *attr.StringValue
 				}
-				dataType = attr.DataType
-				fmt.Printf("  %s: %s (Type: %s)\n", key, value, dataType)
+				logDebug("  Attribute %s=%s (type=%s)\n", key, value, attr.DataType)
 			}
 		}
-		
-		fmt.Println("========================")
 	}
 
-	fmt.Printf("✅ Successfully processed %d SQS records\n", len(sqsEvent.Records))
+	logInfo("Finished processing %d SQS record(s)\n", len(sqsEvent.Records))
 	return nil
 }
 
-// handleScheduledEvent processes EventBridge scheduled events for cleanup
+// handleScheduledEvent processes EventBridge scheduled events for cleanup.
 func handleScheduledEvent(ctx context.Context, event events.CloudWatchEvent) error {
-	fmt.Printf("⏰ === SCHEDULED CLEANUP STARTED ===\n")
-	fmt.Printf("📅 Event Source: %s\n", event.Source)
-	fmt.Printf("🔍 Detail Type: %s\n", event.DetailType)
-	fmt.Printf("⏰ Event Time: %s\n", event.Time.Format(time.RFC3339))
-	
-	// Check for expired sessions and remove permissions
+	logInfo("Scheduled cleanup started (event_time=%s)\n", event.Time.Format(time.RFC3339))
+	logDebug("EventBridge source=%s detail_type=%s\n", event.Source, event.DetailType)
+
 	err := processExpiredSessions(DynamoDbTable, Region)
 	if err != nil {
-		fmt.Printf("❌ Error processing expired sessions: %v\n", err)
+		logError("Error processing expired sessions: %v\n", err)
 		return err
 	}
-	
-	fmt.Printf("✅ Scheduled cleanup completed successfully\n")
+
+	logInfo("Scheduled cleanup completed successfully\n")
 	return nil
 }
 
-// processExpiredSessions finds and removes expired permission assignments
+// processExpiredSessions finds and removes expired permission assignments.
 func processExpiredSessions(table string, region string) error {
-	fmt.Printf("🔍 Checking for expired sessions in table: %s\n", table)
-	
+	logInfo("Checking for expired sessions\n")
+
 	dynamo, err := dynamoDbInitialize(table)
 	if err != nil {
 		return fmt.Errorf("failed to initialize DynamoDB: %v", err)
 	}
 
-	// Get expired records that haven't been processed yet
 	expiredRecords, err := dynamo.GetExpired(false)
 	if err != nil {
 		return fmt.Errorf("failed to get expired records: %v", err)
 	}
 
 	if len(expiredRecords) == 0 {
-		fmt.Printf("✅ No expired sessions found\n")
+		logInfo("No expired sessions found\n")
 		return nil
 	}
 
-	fmt.Printf("🔍 Found %d expired sessions to process\n", len(expiredRecords))
+	logInfo("Found %d expired session(s) to process\n", len(expiredRecords))
 
 	var successCount, errorCount int
 
 	for i, record := range expiredRecords {
-		fmt.Printf("\n--- Processing expired record %d/%d ---\n", i+1, len(expiredRecords))
-		fmt.Printf("📋 RequestID: %s\n", record.RequestID)
-		fmt.Printf("👤 User: %s\n", record.Requester)
-		fmt.Printf("🏦 Account: %s\n", record.AccountID)
-		fmt.Printf("✅ Approver: %s\n", record.Approver)
-		fmt.Printf("⏰ Expired at: %s\n", time.Unix(int64(record.ExpirationTimestamp), 0).Format(time.RFC3339))
+		logInfo("Processing expired record %d/%d (requestId=%s)\n", i+1, len(expiredRecords), record.RequestID)
+		// User email, account ID, and approver are PII — debug only.
+		logDebug("Requester=%s Account=%s Approver=%s ExpiredAt=%s\n",
+			record.Requester, record.AccountID, record.Approver,
+			time.Unix(int64(record.ExpirationTimestamp), 0).Format(time.RFC3339))
 
-		// Remove permission set from Identity Center
 		err := identityCenterRemovePermissionSetWithApprover(
-			record.Requester, 
-			record.AccountID, 
-			"AdministratorAccess", 
-			record.Approver, 
+			record.Requester,
+			record.AccountID,
+			PermissionSet,
+			record.Approver,
 			region,
 		)
 		if err != nil {
-			fmt.Printf("❌ Error removing permission set for %s: %v\n", record.Requester, err)
+			logError("Failed to remove permission set (requestId=%s): %v\n", record.RequestID, err)
 			errorCount++
 			continue
 		}
 
-		// Mark record as expired in DynamoDB
 		err = dynamo.UpdateItemStatus(record.RequestID, record.CreatedTimestamp, dynamodb.Expired)
 		if err != nil {
-			fmt.Printf("❌ Error updating record status to Expired: %v\n", err)
+			logError("Failed to update record status (requestId=%s): %v\n", record.RequestID, err)
 			errorCount++
 			continue
 		}
 
 		successCount++
-		fmt.Printf("✅ Successfully removed access for %s from account %s\n", record.Requester, record.AccountID)
-		
-		// Send notification email about access removal
+		logInfo("Access revoked (requestId=%s)\n", record.RequestID)
+
 		emailErr := sendEmailNotification(
-			record.Requester, 
-			"EXPIRED", 
-			"Your temporary access has expired and been automatically removed", 
-			record.AccountID, 
+			record.Requester,
+			"EXPIRED",
+			"Your temporary access has expired and been automatically removed",
+			record.AccountID,
 			region,
 		)
 		if emailErr != nil {
-			fmt.Printf("⚠️ Failed to send expiration email to %s: %v\n", record.Requester, emailErr)
+			logWarn("Failed to send expiration email (requestId=%s): %v\n", record.RequestID, emailErr)
 		}
 	}
 
-	fmt.Printf("\n📊 === CLEANUP SUMMARY ===\n")
-	fmt.Printf("✅ Successfully processed: %d\n", successCount)
-	fmt.Printf("❌ Errors encountered: %d\n", errorCount)
-	fmt.Printf("📧 Total records processed: %d\n", len(expiredRecords))
+	logInfo("Cleanup summary: succeeded=%d errors=%d total=%d\n", successCount, errorCount, len(expiredRecords))
 
 	if errorCount > 0 {
 		return fmt.Errorf("completed with %d errors out of %d records", errorCount, len(expiredRecords))
@@ -499,43 +512,29 @@ func processExpiredSessions(table string, region string) error {
 }
 
 func main() {
-	fmt.Println("=== Main Function Started ===")
+	logInfo("Starting\n")
 
-	// Check if running in Lambda environment
 	lambdaFunctionName := os.Getenv("AWS_LAMBDA_FUNCTION_NAME")
-	fmt.Printf("AWS_LAMBDA_FUNCTION_NAME: '%s'\n", lambdaFunctionName)
+	logDebug("AWS_LAMBDA_FUNCTION_NAME: '%s'\n", lambdaFunctionName)
 
 	if lambdaFunctionName != "" {
-		fmt.Println("✅ Detected Lambda environment - Starting universal handler...")
+		logInfo("Lambda environment detected — starting universal handler\n")
 		lambda.Start(universalHandler)
 		return
 	}
 
-	// Run the existing expired sessions check
+	logInfo("Local mode — running expired sessions cleanup\n")
 	err := sqsCheckExpiredSessions(DynamoDbTable, Region)
 	if err != nil {
-		fmt.Printf("Error checking expired sessions: %v\n", err)
+		logError("Error checking expired sessions: %v\n", err)
 		panic(err)
 	}
-	// request := dynamodb.DynamoDbPimRequests{
-	// 	Requester: "test.sso@popai.health",
-	// 	Approver:  "volodymyr.l@popai.health",
-	// 	AccountID: "904924507160",
-	// }
-
-	// err := sqsAssignPermissionSet("pim-requests", request, "DataTeam", "us-east-2")
-	// if err != nil {
-	// 	fmt.Printf("Error assigning permission set via SQS: %v\n", err)
-
-	// 	panic(err)
-	// }
-
 }
 
 func sqsCheckExpiredSessions(table string, region string) error {
 	err := updateExpiredSessions(table, region)
 	if err != nil {
-		fmt.Printf("Error updating expired sessions: %v\n", err)
+		logError("Error updating expired sessions: %v\n", err)
 		return err
 	}
 
@@ -548,15 +547,15 @@ func dynamoDbNewRequest(table string, item dynamodb.DynamoDbPimRequests) error {
 		return err
 	}
 
-	fmt.Println("Writing item to DynamoDB...")
+	logDebug("Writing item to DynamoDB (requestId=%s)\n", item.RequestID)
 
 	err = dynamo.WriteItem(item)
 	if err != nil {
-		fmt.Printf("Error writing item: %v\n", err)
+		logError("Error writing item to DynamoDB: %v\n", err)
 		return err
 	}
-	fmt.Println("Item written successfully!")
 
+	logDebug("DynamoDB item written successfully (requestId=%s)\n", item.RequestID)
 	return nil
 }
 
@@ -568,46 +567,45 @@ func dynamoDbUpdateRequestStatus(table string, status dynamodb.RequestStatus, re
 
 	valueTimestamp, err := dynamo.GetCreatedTimestamp(requestId)
 	if err != nil {
-		fmt.Printf("Error getting created timestamp: %v\n", err)
+		logError("Error getting created timestamp (requestId=%s): %v\n", requestId, err)
 		return err
 	}
-	fmt.Printf("Created timestamp retrieved successfully: %v\n", valueTimestamp)
+	logDebug("Created timestamp retrieved (requestId=%s)\n", requestId)
 
 	err = dynamo.UpdateItemStatus(requestId, valueTimestamp, status)
 	if err != nil {
-		fmt.Printf("Error updating item: %v\n", err)
+		logError("Error updating item status (requestId=%s): %v\n", requestId, err)
 		return err
 	}
-	fmt.Println("Item updated successfully!")
 
+	logDebug("Item status updated (requestId=%s, status=%s)\n", requestId, status)
 	return nil
 }
 
 func dynamoDbInitialize(table string) (*dynamodb.DynamoDbConfig, error) {
 	var awsConfig dynamodb.AwsConfig
-	awsConfig.Region = "us-east-2"
+	awsConfig.Region = Region
 
-	fmt.Println("Creating DynamoDB config...")
+	logDebug("Creating DynamoDB config (table=%s, region=%s)\n", table, Region)
 	dynamo, err := dynamodb.NewDynamoDbConfig(awsConfig, table)
 	if err != nil {
-		fmt.Printf("Error creating DynamoDB config: %v\n", err)
+		logError("Error creating DynamoDB config: %v\n", err)
 		return nil, err
 	}
 
-	fmt.Println("Checking if table exists...")
+	logDebug("Checking if DynamoDB table exists\n")
 	err = dynamo.CheckTableExists()
 	if err != nil {
-		fmt.Printf("Error checking table: %v\n", err)
-		fmt.Println("The table 'pim-requests' might not exist in your AWS account")
+		logError("Error checking DynamoDB table '%s': %v\n", table, err)
 		return nil, err
 	}
-	fmt.Println("Table exists!")
 
+	logDebug("DynamoDB table verified\n")
 	return dynamo, nil
 }
 
 func updateExpiredSessions(table string, region string) error {
-	var count int = 0
+	var count int
 	dynamo, err := dynamoDbInitialize(table)
 	if err != nil {
 		return err
@@ -617,22 +615,28 @@ func updateExpiredSessions(table string, region string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Expired items [%v]: %v\n", len(expiredRecords), expiredRecords)
+
+	logInfo("Found %d expired record(s) to process\n", len(expiredRecords))
+	// Full record struct contains PII — debug only.
+	logDebug("Expired records: %v\n", expiredRecords)
 
 	for i := range expiredRecords {
-		err := identityCenterRemovePermissionSetWithApprover(expiredRecords[i].Requester, expiredRecords[i].AccountID, "DataTeam", expiredRecords[i].Approver, region)
+		logInfo("Processing record %d/%d (requestId=%s)\n", i+1, len(expiredRecords), expiredRecords[i].RequestID)
+		err := identityCenterRemovePermissionSetWithApprover(
+			expiredRecords[i].Requester, expiredRecords[i].AccountID, PermissionSet,
+			expiredRecords[i].Approver, region)
 		if err != nil {
-			fmt.Printf("Error removing permission set: %v\n", err)
+			logError("Error removing permission set (requestId=%s): %v\n", expiredRecords[i].RequestID, err)
 			return err
 		}
 
 		err = dynamo.UpdateItemStatus(expiredRecords[i].RequestID, expiredRecords[i].CreatedTimestamp, dynamodb.Expired)
 		if err != nil {
-			fmt.Printf("Error updating item status to Expired: %v. Skiping...\n", err)
+			logError("Error updating item status (requestId=%s): %v\n", expiredRecords[i].RequestID, err)
 			return err
 		}
 		count++
-		fmt.Printf("[%v of %v] Item with RequestID %s marked as Expired\n", count, len(expiredRecords), expiredRecords[i].RequestID)
+		logInfo("Record marked as expired (%d/%d, requestId=%s)\n", count, len(expiredRecords), expiredRecords[i].RequestID)
 	}
 
 	return nil
@@ -641,7 +645,7 @@ func updateExpiredSessions(table string, region string) error {
 func identityCenterInitialize(region string) (*identitycenter.IdentityCenterConfig, error) {
 	ic, err := identitycenter.NewIdentityCenterConfig(region)
 	if err != nil {
-		fmt.Printf("Error creating Identity Center config: %v\n", err)
+		logError("Error creating Identity Center config: %v\n", err)
 		return nil, err
 	}
 
@@ -656,7 +660,7 @@ func identityCenterAssignPermissionSet(email, accountID, permissionSet string, r
 
 	err = ic.AssignUserToAccountByEmail(email, accountID, permissionSet)
 	if err != nil {
-		fmt.Printf("Error assigning permission set: %v\n", err)
+		logError("Error assigning permission set: %v\n", err)
 		return err
 	}
 
@@ -669,13 +673,13 @@ func validateApprover(approverEmail string, region string) error {
 		return err
 	}
 
-	fmt.Printf("Validating approver: %s...\n", approverEmail)
+	logDebug("Validating approver exists in Identity Center\n")
 	_, err = ic.FindUserByEmail(approverEmail)
 	if err != nil {
-		return fmt.Errorf("approver validation failed: approver %s is not a valid user in the organization: %v", approverEmail, err)
+		return fmt.Errorf("approver validation failed: approver is not a valid user in the organization: %v", err)
 	}
 
-	fmt.Printf("✅ Approver %s validated successfully\n", approverEmail)
+	logDebug("Approver validated in Identity Center\n")
 	return nil
 }
 
@@ -687,7 +691,7 @@ func identityCenterRemovePermissionSet(email, accountID, permissionSet string, r
 
 	err = ic.RemoveUserFromAccountByEmail(email, accountID, permissionSet)
 	if err != nil {
-		fmt.Printf("Error removing permission set: %v\n", err)
+		logError("Error removing permission set: %v\n", err)
 		return err
 	}
 
@@ -695,10 +699,9 @@ func identityCenterRemovePermissionSet(email, accountID, permissionSet string, r
 }
 
 func identityCenterRemovePermissionSetWithApprover(email, accountID, permissionSet, approverEmail, region string) error {
-	// Validate approver before proceeding with removal
 	err := validateApprover(approverEmail, region)
 	if err != nil {
-		fmt.Printf("⚠️  Skipping permission removal: %v\n", err)
+		logWarn("Skipping permission removal — approver validation failed: %v\n", err)
 		return err
 	}
 
@@ -708,13 +711,13 @@ func identityCenterRemovePermissionSetWithApprover(email, accountID, permissionS
 func sqsAssignPermissionSet(table string, item dynamodb.DynamoDbPimRequests, permissionSet string, region string) error {
 	err := validateApprover(item.Approver, region)
 	if err != nil {
-		fmt.Printf("⚠️  Skipping permission assignment: %v\n", err)
+		logWarn("Skipping permission assignment — approver validation failed: %v\n", err)
 		return err
 	}
 
 	err = identityCenterAssignPermissionSet(item.Requester, item.AccountID, permissionSet, region)
 	if err != nil {
-		fmt.Printf("Error assigning permission set: %v\n", err)
+		logError("Error assigning permission set: %v\n", err)
 		return err
 	}
 
@@ -728,7 +731,7 @@ func sqsAssignPermissionSet(table string, item dynamodb.DynamoDbPimRequests, per
 
 	err = dynamoDbNewRequest(table, item)
 	if err != nil {
-		fmt.Printf("Error storing request in DynamoDB: %v\n", err)
+		logError("Error storing request in DynamoDB: %v\n", err)
 		return err
 	}
 
