@@ -35,12 +35,34 @@ The Slack bot sends messages in this format:
 
 ```json
 {
-  "requestor": "user@example.com",
-  "approver":  "manager@example.com",
-  "account":   "123456789012",
-  "datetime":  "2026-03-11T10:00:00Z"
+  "request_id":             "a1b2c3d4e5f6g7h8",
+  "requestor":              "user@example.com",
+  "requestor_slack_user_id":"UXXXXXXXXX",
+  "approver":               "manager@example.com",
+  "account":                "123456789012",
+  "datetime":               "2026-06-05 10:00"
 }
 ```
+
+After processing, the Lambda sends a result back to the response queue:
+
+```json
+{
+  "request_id":   "a1b2c3d4e5f6g7h8",
+  "slack_user_id":"UXXXXXXXXX",
+  "account_id":   "123456789012",
+  "account_name": "",
+  "status":       "granted",
+  "reason":       ""
+}
+```
+
+| Status | Meaning |
+|---|---|
+| `granted` | Permission assigned successfully |
+| `rejected` | Request refused (unauthorized approver, management account) |
+| `failed` | Technical error during processing |
+| `revoked` | Access removed by cleanup job |
 
 ---
 
@@ -333,3 +355,4 @@ awspim-manager/
 ## Related
 
 - **Slack bot (frontend):** [github.com/serenityzn/awspim](https://github.com/serenityzn/awspim)
+- **Terraform (full infrastructure):** [github.com/serenityzn/awspim/tree/main/terraform](https://github.com/serenityzn/awspim/tree/main/terraform)
