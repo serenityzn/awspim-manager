@@ -7,6 +7,8 @@ import (
 	"os"
 	"pim-manager/pkg/dynamodb"
 	"pim-manager/pkg/identitycenter"
+	"net/mail"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -149,6 +151,37 @@ type SQSMessage struct {
 	Approver  string `json:"approver"`
 	Account   string `json:"account"`
 	Datetime  string `json:"datetime"`
+}
+
+// accountIDRegex validates AWS account IDs: exactly 12 digits.
+var accountIDRegex = regexp.MustCompile(`^\d{12}$`)
+
+// validateEmail checks email format using Go's standard RFC 5322 parser.
+func validateEmail(field, value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s is empty", field)
+	}
+	if _, err := mail.ParseAddress(value); err != nil {
+		return fmt.Errorf("%s is not a valid email address: %v", field, err)
+	}
+	return nil
+}
+
+// validateSQSMessage checks that all required fields are present and well-formed.
+func validateSQSMessage(msg SQSMessage) error {
+	if err := validateEmail("requestor", msg.Requestor); err != nil {
+		return err
+	}
+	if err := validateEmail("approver", msg.Approver); err != nil {
+		return err
+	}
+	if strings.TrimSpace(msg.Account) == "" {
+		return fmt.Errorf("account is empty")
+	}
+	if !accountIDRegex.MatchString(strings.TrimSpace(msg.Account)) {
+		return fmt.Errorf("account must be a 12-digit AWS account ID")
+	}
+	return nil
 }
 
 // getApproversFromSecret fetches the list of approved users from AWS Secrets Manager.
@@ -341,6 +374,11 @@ func handleSQSEvent(ctx context.Context, sqsEvent events.SQSEvent) error {
 		if err := json.Unmarshal([]byte(record.Body), &message); err != nil {
 			logError("Failed to parse SQS message body (messageId=%s): %v\n", record.MessageId, err)
 			logDebug("Raw body that failed to parse: %s\n", record.Body)
+			continue
+		}
+
+		if err := validateSQSMessage(message); err != nil {
+			logError("Invalid SQS message (messageId=%s): %v\n", record.MessageId, err)
 			continue
 		}
 
