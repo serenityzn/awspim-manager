@@ -4,14 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"pim-manager/pkg/dynamodb"
-	"pim-manager/pkg/identitycenter"
 	"net/mail"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"pim-manager/pkg/dynamodb"
+	"pim-manager/pkg/identitycenter"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
@@ -19,20 +20,28 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/secretsmanager"
 	"github.com/aws/aws-sdk-go/service/ses"
+	sqssdk "github.com/aws/aws-sdk-go/service/sqs"
 	"github.com/google/uuid"
 )
 
 var (
-	expiration        dynamodb.Timestamp
-	Region            string
-	DynamoDbTable     string
-	ApproversSecret   string
-	ManagementAccount string
-	PermissionSet     string
+	expiration           dynamodb.Timestamp
+	Region               string
+	DynamoDbTable        string
+	ApproversSecret      string
+	ManagementAccount    string
+	PermissionSet        string
+	ResponseQueueURL     string
+	SESFromEmail         string
 	// LogLevel controls verbosity. Accepted values: "debug", "info" (default).
 	// Set LOG_LEVEL=debug to include PII such as email addresses, account IDs,
 	// and raw SQS message bodies in CloudWatch logs.
 	LogLevel string
+
+	// configError captures the first missing-required-env-var error detected
+	// during init(). It is checked at handler invocation time so that unit
+	// tests (whose env-var setup runs after package init()) are not blocked.
+	configError error
 )
 
 // isDebug returns true when debug-level logging is enabled.
@@ -71,28 +80,32 @@ func init() {
 	logDebug("AWS_REGION: '%s'\n", Region)
 	if Region == "" {
 		logError("AWS_REGION is not set\n")
-		panic(fmt.Errorf("AWS_REGION is not set!"))
+		configError = fmt.Errorf("AWS_REGION is not set")
+		return
 	}
 
 	DynamoDbTable = os.Getenv("DYNAMO_TABLE")
 	logDebug("DYNAMO_TABLE: '%s'\n", DynamoDbTable)
 	if DynamoDbTable == "" {
 		logError("DYNAMO_TABLE is not set\n")
-		panic(fmt.Errorf("DynamoDbTable is not set!"))
+		configError = fmt.Errorf("DYNAMO_TABLE is not set")
+		return
 	}
 
 	ApproversSecret = os.Getenv("APPROVERS")
 	logDebug("APPROVERS secret name: '%s'\n", ApproversSecret)
 	if ApproversSecret == "" {
 		logError("APPROVERS secret name is not set\n")
-		panic(fmt.Errorf("APPROVERS is not set!"))
+		configError = fmt.Errorf("APPROVERS is not set")
+		return
 	}
 
 	ManagementAccount = os.Getenv("MANAGEMENT_ACCOUNT")
 	logDebug("MANAGEMENT_ACCOUNT configured\n")
 	if ManagementAccount == "" {
 		logError("MANAGEMENT_ACCOUNT is not set\n")
-		panic(fmt.Errorf("MANAGEMENT_ACCOUNT is not set!"))
+		configError = fmt.Errorf("MANAGEMENT_ACCOUNT is not set")
+		return
 	}
 
 	sessionTimeoutStr := os.Getenv("SESSION_TIMEOUT")
@@ -104,11 +117,13 @@ func init() {
 		timeoutSeconds, err := strconv.ParseInt(sessionTimeoutStr, 10, 64)
 		if err != nil {
 			logError("SESSION_TIMEOUT is not a valid number: %v\n", err)
-			panic(fmt.Errorf("SESSION_TIMEOUT must be a valid number of seconds"))
+			configError = fmt.Errorf("SESSION_TIMEOUT must be a valid number of seconds")
+			return
 		}
 		if timeoutSeconds <= 0 {
 			logError("SESSION_TIMEOUT must be positive, got: %d\n", timeoutSeconds)
-			panic(fmt.Errorf("SESSION_TIMEOUT must be positive"))
+			configError = fmt.Errorf("SESSION_TIMEOUT must be positive")
+			return
 		}
 		expiration = dynamodb.Timestamp(timeoutSeconds)
 	}
@@ -120,6 +135,21 @@ func init() {
 	} else {
 		logInfo("PIM_ROLE set to: %s\n", PermissionSet)
 	}
+
+	ResponseQueueURL = os.Getenv("SQS_RESPONSE_QUEUE_URL")
+	if ResponseQueueURL == "" {
+		logWarn("SQS_RESPONSE_QUEUE_URL is not set — Slack response notifications will be skipped\n")
+	} else {
+		logInfo("SQS_RESPONSE_QUEUE_URL configured\n")
+	}
+
+	SESFromEmail = os.Getenv("SES_FROM_EMAIL")
+	if SESFromEmail == "" {
+		logError("SES_FROM_EMAIL is not set\n")
+		configError = fmt.Errorf("SES_FROM_EMAIL is not set")
+		return
+	}
+	logInfo("SES_FROM_EMAIL configured\n")
 
 	logInfo("=== Lambda Function Initialized (region=%s, timeout=%s) ===\n", Region, formatDuration(int64(expiration)))
 }
@@ -145,12 +175,25 @@ func formatDuration(seconds int64) string {
 	}
 }
 
-// SQSMessage represents the expected structure of SQS message body.
+// SQSMessage represents the incoming approval request from the awspim Slack bot.
 type SQSMessage struct {
-	Requestor string `json:"requestor"`
-	Approver  string `json:"approver"`
-	Account   string `json:"account"`
-	Datetime  string `json:"datetime"`
+	RequestID            string `json:"request_id"`
+	Requestor            string `json:"requestor"`
+	RequestorSlackUserID string `json:"requestor_slack_user_id"`
+	Approver             string `json:"approver"`
+	Account              string `json:"account"`
+	Datetime             string `json:"datetime"`
+}
+
+// SQSResponseMessage is the result sent back to the Slack bot response queue.
+// Status must be one of: granted, revoked, rejected, failed.
+type SQSResponseMessage struct {
+	RequestID   string `json:"request_id"`
+	SlackUserID string `json:"slack_user_id"`
+	AccountID   string `json:"account_id"`
+	AccountName string `json:"account_name"`
+	Status      string `json:"status"`
+	Reason      string `json:"reason"`
 }
 
 // accountIDRegex validates AWS account IDs: exactly 12 digits.
@@ -169,8 +212,14 @@ func validateEmail(field, value string) error {
 
 // validateSQSMessage checks that all required fields are present and well-formed.
 func validateSQSMessage(msg SQSMessage) error {
+	if strings.TrimSpace(msg.RequestID) == "" {
+		return fmt.Errorf("request_id is empty")
+	}
 	if err := validateEmail("requestor", msg.Requestor); err != nil {
 		return err
+	}
+	if strings.TrimSpace(msg.RequestorSlackUserID) == "" {
+		return fmt.Errorf("requestor_slack_user_id is empty")
 	}
 	if err := validateEmail("approver", msg.Approver); err != nil {
 		return err
@@ -316,7 +365,7 @@ This is an automated notification from the PIM system.
 				Data:    aws.String(subject),
 			},
 		},
-		Source: aws.String("noreply@popai.health"), // Change to your verified SES email
+		Source: aws.String(SESFromEmail),
 	}
 
 	_, err = svc.SendEmail(input)
@@ -329,8 +378,50 @@ This is an automated notification from the PIM system.
 	return nil
 }
 
+// sendSQSResponse publishes a result message to the Slack bot response queue.
+// If queueURL is empty the call is a no-op (response queue not configured).
+func sendSQSResponse(response SQSResponseMessage, queueURL, region string) error {
+	if queueURL == "" {
+		logWarn("Response queue URL not configured — skipping Slack response (requestId=%s)\n", response.RequestID)
+		return nil
+	}
+
+	body, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to marshal SQS response: %v", err)
+	}
+
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String(region),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create AWS session for SQS: %v", err)
+	}
+
+	svc := sqssdk.New(sess)
+	_, err = svc.SendMessage(&sqssdk.SendMessageInput{
+		QueueUrl:    aws.String(queueURL),
+		MessageBody: aws.String(string(body)),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to send SQS response message: %v", err)
+	}
+
+	logDebug("SQS response sent (requestId=%s, status=%s, queueURL=%s)\n",
+		response.RequestID, response.Status, queueURL)
+	return nil
+}
+
 // universalHandler handles both SQS and EventBridge events.
 func universalHandler(ctx context.Context, event interface{}) error {
+	// configError is set when a required env var was missing at startup.
+	// Checked here (not in init) so that test init() functions have a chance
+	// to set env vars before any handler logic runs.
+	if configError != nil {
+		logError("Configuration error: %v\n", configError)
+		return configError
+	}
+
 	logInfo("Received Lambda event\n")
 
 	eventBytes, err := json.Marshal(event)
@@ -383,29 +474,33 @@ func handleSQSEvent(ctx context.Context, sqsEvent events.SQSEvent) error {
 		}
 
 		// All fields contain PII or account metadata — debug only.
-		logDebug("Requestor=%s Approver=%s Account=%s Datetime=%s\n",
-			message.Requestor, message.Approver, message.Account, message.Datetime)
+		logDebug("RequestID=%s Requestor=%s SlackUserID=%s Approver=%s Account=%s Datetime=%s\n",
+			message.RequestID, message.Requestor, message.RequestorSlackUserID,
+			message.Approver, message.Account, message.Datetime)
 		if isDebug() {
 			prettyBytes, _ := json.MarshalIndent(message, "", "  ")
 			logDebug("Structured message:\n%s\n", string(prettyBytes))
 		}
 
-		var rejectionReason string
-		var success bool
+		var reason string
+		// responseStatus tracks the Slack bot status: granted | rejected | failed.
+		var responseStatus string
 
 		// 1. Validate approver is authorized.
 		err := validateApproverFromSecret(message.Approver, ApproversSecret, Region)
 		if err != nil {
-			rejectionReason = fmt.Sprintf("Unauthorized approver: %v", err)
+			reason = fmt.Sprintf("The approver %s is not in the authorised approvers list for this account.", message.Approver)
+			responseStatus = "rejected"
 			logInfo("Request rejected (messageId=%s): unauthorized approver\n", record.MessageId)
-			logDebug("Rejection detail: %s\n", rejectionReason)
+			logDebug("Rejection detail: %v\n", err)
 		} else {
 			// 2. Validate not requesting management account.
 			err = validateNotManagementAccount(message.Account, ManagementAccount)
 			if err != nil {
-				rejectionReason = fmt.Sprintf("Management account protection: %v", err)
+				reason = fmt.Sprintf("Access to the management account is not permitted.")
+				responseStatus = "rejected"
 				logInfo("Request rejected (messageId=%s): management account protection\n", record.MessageId)
-				logDebug("Rejection detail: %s\n", rejectionReason)
+				logDebug("Rejection detail: %v\n", err)
 			} else {
 				// 3. All validations passed — proceed with assignment.
 				pimRequest := dynamodb.DynamoDbPimRequests{
@@ -420,26 +515,38 @@ func handleSQSEvent(ctx context.Context, sqsEvent events.SQSEvent) error {
 
 				err = sqsAssignPermissionSet(DynamoDbTable, pimRequest, permissionSet, Region)
 				if err != nil {
-					rejectionReason = fmt.Sprintf("Permission assignment failed: %v", err)
+					reason = fmt.Sprintf("Permission assignment failed: %v", err)
+					responseStatus = "failed"
 					logInfo("Request failed (messageId=%s): permission assignment error\n", record.MessageId)
-					logDebug("Error detail: %s\n", rejectionReason)
+					logDebug("Error detail: %s\n", reason)
 				} else {
-					success = true
+					responseStatus = "granted"
 					logInfo("Access granted (messageId=%s)\n", record.MessageId)
 				}
 			}
 		}
 
-		// 4. Send email notification.
-		var status string
-		if success {
-			status = "APPROVED"
-			rejectionReason = ""
-		} else {
-			status = "REJECTED"
+		// 4. Send Slack response to the response queue.
+		sqsResponse := SQSResponseMessage{
+			RequestID:   message.RequestID,
+			SlackUserID: message.RequestorSlackUserID,
+			AccountID:   message.Account,
+			Status:      responseStatus,
+			Reason:      reason,
+		}
+		if respErr := sendSQSResponse(sqsResponse, ResponseQueueURL, Region); respErr != nil {
+			logWarn("Failed to send SQS response (messageId=%s): %v\n", record.MessageId, respErr)
 		}
 
-		emailErr := sendEmailNotification(message.Requestor, status, rejectionReason, message.Account, Region)
+		// 5. Send email notification.
+		var emailStatus string
+		if responseStatus == "granted" {
+			emailStatus = "APPROVED"
+		} else {
+			emailStatus = "REJECTED"
+		}
+
+		emailErr := sendEmailNotification(message.Requestor, emailStatus, reason, message.Account, Region)
 		if emailErr != nil {
 			logWarn("Failed to send email notification (messageId=%s): %v\n", record.MessageId, emailErr)
 		}
@@ -559,6 +666,11 @@ func main() {
 		logInfo("Lambda environment detected — starting universal handler\n")
 		lambda.Start(universalHandler)
 		return
+	}
+
+	if configError != nil {
+		logError("Configuration error: %v\n", configError)
+		panic(configError)
 	}
 
 	logInfo("Local mode — running expired sessions cleanup\n")

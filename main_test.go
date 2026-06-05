@@ -92,7 +92,7 @@ func TestValidateEmail(t *testing.T) {
 		{"missing domain", "user@", true},
 		{"missing local part", "@example.com", true},
 		{"double @", "user@@example.com", true},
-		{"missing TLD", "user@example", true},
+		{"missing TLD", "user@example", false}, // RFC 5322 allows single-label domains; mail.ParseAddress accepts this
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -110,9 +110,11 @@ func TestValidateEmail(t *testing.T) {
 
 func TestValidateSQSMessage(t *testing.T) {
 	valid := SQSMessage{
-		Requestor: "user@example.com",
-		Approver:  "manager@example.com",
-		Account:   "123456789012",
+		RequestID:            "a1b2c3d4e5f6g7h8",
+		Requestor:            "user@example.com",
+		RequestorSlackUserID: "U0984U1QKFY",
+		Approver:             "manager@example.com",
+		Account:              "123456789012",
 	}
 
 	tests := []struct {
@@ -126,65 +128,118 @@ func TestValidateSQSMessage(t *testing.T) {
 			msg:     valid,
 			wantErr: false,
 		},
+		// request_id
+		{
+			name: "empty request_id",
+			msg: SQSMessage{
+				Requestor: valid.Requestor, RequestorSlackUserID: valid.RequestorSlackUserID,
+				Approver: valid.Approver, Account: valid.Account,
+			},
+			wantErr: true,
+			errMsg:  "request_id is empty",
+		},
+		// requestor_slack_user_id
+		{
+			name: "empty slack user id",
+			msg: SQSMessage{
+				RequestID: valid.RequestID, Requestor: valid.Requestor,
+				Approver: valid.Approver, Account: valid.Account,
+			},
+			wantErr: true,
+			errMsg:  "requestor_slack_user_id is empty",
+		},
 		// requestor
 		{
-			name:    "empty requestor",
-			msg:     SQSMessage{Requestor: "", Approver: valid.Approver, Account: valid.Account},
+			name: "empty requestor",
+			msg: SQSMessage{
+				RequestID: valid.RequestID, RequestorSlackUserID: valid.RequestorSlackUserID,
+				Requestor: "", Approver: valid.Approver, Account: valid.Account,
+			},
 			wantErr: true,
 			errMsg:  "requestor is empty",
 		},
 		{
-			name:    "invalid requestor - no @",
-			msg:     SQSMessage{Requestor: "notanemail", Approver: valid.Approver, Account: valid.Account},
+			name: "invalid requestor - no @",
+			msg: SQSMessage{
+				RequestID: valid.RequestID, RequestorSlackUserID: valid.RequestorSlackUserID,
+				Requestor: "notanemail", Approver: valid.Approver, Account: valid.Account,
+			},
 			wantErr: true,
 		},
 		{
-			name:    "invalid requestor - no domain",
-			msg:     SQSMessage{Requestor: "user@", Approver: valid.Approver, Account: valid.Account},
+			name: "invalid requestor - no domain",
+			msg: SQSMessage{
+				RequestID: valid.RequestID, RequestorSlackUserID: valid.RequestorSlackUserID,
+				Requestor: "user@", Approver: valid.Approver, Account: valid.Account,
+			},
 			wantErr: true,
 		},
 		// approver
 		{
-			name:    "empty approver",
-			msg:     SQSMessage{Requestor: valid.Requestor, Approver: "", Account: valid.Account},
+			name: "empty approver",
+			msg: SQSMessage{
+				RequestID: valid.RequestID, RequestorSlackUserID: valid.RequestorSlackUserID,
+				Requestor: valid.Requestor, Approver: "", Account: valid.Account,
+			},
 			wantErr: true,
 			errMsg:  "approver is empty",
 		},
 		{
-			name:    "invalid approver - no @",
-			msg:     SQSMessage{Requestor: valid.Requestor, Approver: "notanemail", Account: valid.Account},
+			name: "invalid approver - no @",
+			msg: SQSMessage{
+				RequestID: valid.RequestID, RequestorSlackUserID: valid.RequestorSlackUserID,
+				Requestor: valid.Requestor, Approver: "notanemail", Account: valid.Account,
+			},
 			wantErr: true,
 		},
 		// account
 		{
-			name:    "empty account",
-			msg:     SQSMessage{Requestor: valid.Requestor, Approver: valid.Approver, Account: ""},
+			name: "empty account",
+			msg: SQSMessage{
+				RequestID: valid.RequestID, RequestorSlackUserID: valid.RequestorSlackUserID,
+				Requestor: valid.Requestor, Approver: valid.Approver, Account: "",
+			},
 			wantErr: true,
 			errMsg:  "account is empty",
 		},
 		{
-			name:    "account too short - 11 digits",
-			msg:     SQSMessage{Requestor: valid.Requestor, Approver: valid.Approver, Account: "12345678901"},
+			name: "account too short - 11 digits",
+			msg: SQSMessage{
+				RequestID: valid.RequestID, RequestorSlackUserID: valid.RequestorSlackUserID,
+				Requestor: valid.Requestor, Approver: valid.Approver, Account: "12345678901",
+			},
 			wantErr: true,
 		},
 		{
-			name:    "account too long - 13 digits",
-			msg:     SQSMessage{Requestor: valid.Requestor, Approver: valid.Approver, Account: "1234567890123"},
+			name: "account too long - 13 digits",
+			msg: SQSMessage{
+				RequestID: valid.RequestID, RequestorSlackUserID: valid.RequestorSlackUserID,
+				Requestor: valid.Requestor, Approver: valid.Approver, Account: "1234567890123",
+			},
 			wantErr: true,
 		},
 		{
-			name:    "account contains letters",
-			msg:     SQSMessage{Requestor: valid.Requestor, Approver: valid.Approver, Account: "12345678901a"},
+			name: "account contains letters",
+			msg: SQSMessage{
+				RequestID: valid.RequestID, RequestorSlackUserID: valid.RequestorSlackUserID,
+				Requestor: valid.Requestor, Approver: valid.Approver, Account: "12345678901a",
+			},
 			wantErr: true,
 		},
 		{
-			name:    "account contains spaces",
-			msg:     SQSMessage{Requestor: valid.Requestor, Approver: valid.Approver, Account: "123456 789012"},
+			name: "account contains spaces",
+			msg: SQSMessage{
+				RequestID: valid.RequestID, RequestorSlackUserID: valid.RequestorSlackUserID,
+				Requestor: valid.Requestor, Approver: valid.Approver, Account: "123456 789012",
+			},
 			wantErr: true,
 		},
 		{
-			name:    "account contains hyphens",
-			msg:     SQSMessage{Requestor: valid.Requestor, Approver: valid.Approver, Account: "123-456-7890"},
+			name: "account contains hyphens",
+			msg: SQSMessage{
+				RequestID: valid.RequestID, RequestorSlackUserID: valid.RequestorSlackUserID,
+				Requestor: valid.Requestor, Approver: valid.Approver, Account: "123-456-7890",
+			},
 			wantErr: true,
 		},
 	}

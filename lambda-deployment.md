@@ -1,192 +1,369 @@
-# AWS Lambda Deployment Guide
+# Lambda Deployment Guide
 
-## Lambda Handler Function
+## Overview
 
-The `lambdaHandler` function in `main.go` is designed to process SQS events as AWS Lambda triggers.
+The Lambda function handles two event types:
 
-### Function Features
+| Event source | Purpose |
+|---|---|
+| SQS (`PIM-SQS` / `PIM-SQS-TEST`) | Processes Slack bot approval requests — assigns AWS SSO permissions and sends a result back to the response queue |
+| EventBridge (scheduled rule) | Runs periodic cleanup — revokes expired temporary access |
 
-- **Automatic Environment Detection**: Detects if running in Lambda vs local mode
-- **SQS Event Processing**: Handles multiple SQS records per event
-- **Message Parsing**: Pretty-prints JSON message bodies
-- **Complete Logging**: Displays all message attributes and metadata
+---
 
-### Sample Output
-
-```
-Received SQS event with 2 records
-=== SQS Record 1/2 ===
-MessageId: 12345678-1234-1234-1234-123456789012
-EventSource: aws:sqs
-EventSourceARN: arn:aws:sqs:us-east-1:123456789012:my-queue
-ReceiptHandle: AQEB...
-Body: {"action":"assign","user":"john.doe@company.com","account":"123456789012"}
-Parsed JSON Body:
-{
-  "action": "assign",
-  "user": "john.doe@company.com", 
-  "account": "123456789012"
-}
-Attributes: map[ApproximateReceiveCount:1 SentTimestamp:1234567890000]
-========================
-```
-
-## Deployment Steps
-
-### 1. Build for Lambda
+## 1. Build
 
 ```bash
-# Build for Linux (Lambda runtime)
-GOOS=linux GOARCH=amd64 go build -o bootstrap main.go
+# Target the Lambda execution environment (arm64 = Graviton2, cheapest; swap for amd64 if needed)
+GOOS=linux GOARCH=arm64 go build -tags lambda.norpc -o bootstrap .
 
-# Create deployment package
+# Package
 zip lambda-function.zip bootstrap
 ```
 
-### 2. Create Lambda Function
+---
+
+## 2. Create the Lambda Function
 
 ```bash
-# Using AWS CLI
 aws lambda create-function \
-    --function-name pim-sqs-processor \
-    --runtime provided.al2 \
-    --role arn:aws:iam::YOUR-ACCOUNT:role/lambda-execution-role \
-    --handler bootstrap \
-    --zip-file fileb://lambda-function.zip \
-    --environment Variables='{
-        "AWS_REGION":"us-east-1",
-        "DYNAMO_TABLE":"pim-requests",
-        "adminUsers":"admin@company.com,superuser@company.com"
-    }'
+  --function-name pim-manager \
+  --runtime provided.al2023 \
+  --architectures arm64 \
+  --role arn:aws:iam::YOUR_ACCOUNT_ID:role/pim-manager-execution-role \
+  --handler bootstrap \
+  --zip-file fileb://lambda-function.zip \
+  --timeout 60 \
+  --memory-size 256 \
+  --environment 'Variables={
+    AWS_REGION=us-east-2,
+    DYNAMO_TABLE=pim-requests,
+    APPROVERS=pim-approvers-secret,
+    MANAGEMENT_ACCOUNT=000000000000,
+    SESSION_TIMEOUT=3600,
+    PIM_ROLE=AdministratorAccess,
+    SQS_RESPONSE_QUEUE_URL=https://sqs.us-east-2.amazonaws.com/SLACK_BOT_ACCOUNT_ID/PIM-SQS-Response,
+    SES_FROM_EMAIL=noreply@yourdomain.com,
+    LOG_LEVEL=info
+  }'
 ```
 
-### 3. Set up SQS Trigger
+> Replace `YOUR_ACCOUNT_ID`, `YOUR_MANAGEMENT_ACCOUNT_ID`, `SLACK_BOT_ACCOUNT_ID` (the AWS account that owns the Slack bot's response queue), and all other placeholder values with your real values.
+
+### Update existing function code
 
 ```bash
-# Add SQS as event source
+aws lambda update-function-code \
+  --function-name pim-manager \
+  --zip-file fileb://lambda-function.zip
+```
+
+### Update environment variables
+
+```bash
+aws lambda update-function-configuration \
+  --function-name pim-manager \
+  --environment 'Variables={
+    AWS_REGION=us-east-2,
+    DYNAMO_TABLE=pim-requests,
+    APPROVERS=pim-approvers-secret,
+    MANAGEMENT_ACCOUNT=YOUR_MANAGEMENT_ACCOUNT_ID,
+    SESSION_TIMEOUT=3600,
+    PIM_ROLE=AdministratorAccess,
+    SQS_RESPONSE_QUEUE_URL=https://sqs.us-east-2.amazonaws.com/SLACK_BOT_ACCOUNT_ID/PIM-SQS-Response,
+    SES_FROM_EMAIL=noreply@yourdomain.com,
+    LOG_LEVEL=info
+  }'
+```
+
+---
+
+## 3. Environment Variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `AWS_REGION` | **Yes** | — | AWS region for all service calls |
+| `DYNAMO_TABLE` | **Yes** | — | DynamoDB table that stores active PIM sessions |
+| `APPROVERS` | **Yes** | — | Secrets Manager secret name containing the allowed approver email list (JSON array) |
+| `MANAGEMENT_ACCOUNT` | **Yes** | — | AWS account ID of the management account — access requests for this account are always rejected |
+| `SQS_RESPONSE_QUEUE_URL` | **Yes** | — | Full URL of the Slack bot response queue (`PIM-SQS-Response`) |
+| `SES_FROM_EMAIL` | **Yes** | — | Verified SES sender address used for email notifications (e.g. `noreply@yourdomain.com`) |
+| `SESSION_TIMEOUT` | No | `3600` | How long (seconds) temporary access is valid before automatic revocation |
+| `PIM_ROLE` | No | `AdministratorAccess` | Name or ARN of the SSO permission set to assign |
+| `LOG_LEVEL` | No | `info` | Verbosity: `info` or `debug` (debug logs PII — do not use in production) |
+
+### Approvers secret format
+
+The value stored in Secrets Manager under `APPROVERS` must be a JSON array of email addresses:
+
+```json
+["manager@example.com", "admin@example.com"]
+```
+
+---
+
+## 4. SQS Trigger (Request Queue)
+
+```bash
+# Test environment
 aws lambda create-event-source-mapping \
-    --function-name pim-sqs-processor \
-    --event-source-arn arn:aws:sqs:us-east-1:YOUR-ACCOUNT:your-queue-name \
-    --batch-size 10
+  --function-name pim-manager \
+  --event-source-arn arn:aws:sqs:us-east-2:YOUR_ACCOUNT_ID:PIM-SQS-TEST \
+  --batch-size 1 \
+  --maximum-batching-window-in-seconds 0
+
+# Production environment
+aws lambda create-event-source-mapping \
+  --function-name pim-manager \
+  --event-source-arn arn:aws:sqs:us-east-2:YOUR_ACCOUNT_ID:PIM-SQS \
+  --batch-size 1 \
+  --maximum-batching-window-in-seconds 0
 ```
 
-## IAM Permissions
+> `batch-size 1` is recommended so each approval is processed and responded to individually.
 
-### Lambda Execution Role
+---
 
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "logs:CreateLogGroup",
-                "logs:CreateLogStream", 
-                "logs:PutLogEvents"
-            ],
-            "Resource": "arn:aws:logs:*:*:*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "sqs:ReceiveMessage",
-                "sqs:DeleteMessage",
-                "sqs:GetQueueAttributes"
-            ],
-            "Resource": "arn:aws:sqs:*:*:your-queue-name"
-        },
-        {
-            "Effect": "Allow", 
-            "Action": [
-                "dynamodb:GetItem",
-                "dynamodb:PutItem",
-                "dynamodb:UpdateItem",
-                "dynamodb:Query",
-                "dynamodb:Scan"
-            ],
-            "Resource": "arn:aws:dynamodb:*:*:table/pim-requests"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "sso:*",
-                "sso-admin:*",
-                "identitystore:*",
-                "organizations:DescribeAccount"
-            ],
-            "Resource": "*"
-        }
-    ]
-}
-```
-
-## Local Testing
-
-### Test with Sample SQS Event
-
-Create `test-event.json`:
-
-```json
-{
-    "Records": [
-        {
-            "messageId": "test-message-1",
-            "receiptHandle": "test-receipt-handle",
-            "body": "{\"action\":\"assign\",\"user\":\"test@example.com\",\"account\":\"123456789012\"}",
-            "attributes": {
-                "ApproximateReceiveCount": "1",
-                "SentTimestamp": "1234567890000"
-            },
-            "messageAttributes": {},
-            "eventSource": "aws:sqs",
-            "eventSourceARN": "arn:aws:sqs:us-east-1:123456789012:test-queue"
-        }
-    ]
-}
-```
-
-### Run Locally
+## 5. EventBridge Trigger (Scheduled Cleanup)
 
 ```bash
-# Set environment variables
-export AWS_REGION=us-east-1
-export DYNAMO_TABLE=pim-requests
-export adminUsers="admin@company.com"
+# Create a rule that fires every 15 minutes
+aws events put-rule \
+  --name pim-cleanup-schedule \
+  --schedule-expression "rate(15 minutes)" \
+  --state ENABLED
 
-# Run in local mode (without Lambda environment)
-go run main.go
+# Allow EventBridge to invoke the Lambda
+aws lambda add-permission \
+  --function-name pim-manager \
+  --statement-id pim-cleanup-schedule \
+  --action lambda:InvokeFunction \
+  --principal events.amazonaws.com \
+  --source-arn arn:aws:events:us-east-2:YOUR_ACCOUNT_ID:rule/pim-cleanup-schedule
 
-# Or test with lambda-go-test (if installed)
-# echo '{}' | lambda-go-test -handler lambdaHandler
+# Attach Lambda as the target
+aws events put-targets \
+  --rule pim-cleanup-schedule \
+  --targets "Id=pim-manager,Arn=arn:aws:lambda:us-east-2:YOUR_ACCOUNT_ID:function:pim-manager"
 ```
 
-## Environment Variables
+---
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `AWS_REGION` | AWS region for services | Yes |
-| `DYNAMO_TABLE` | DynamoDB table name | Yes |
-| `adminUsers` | Comma-separated admin emails | No |
-| `AWS_LAMBDA_FUNCTION_NAME` | Auto-set by Lambda runtime | Auto |
+## 6. IAM Execution Role
 
-## Monitoring
+Create role `pim-manager-execution-role` with trust policy for Lambda:
 
-- **CloudWatch Logs**: Automatic logging to `/aws/lambda/pim-sqs-processor`
-- **CloudWatch Metrics**: Lambda duration, errors, invocations
-- **X-Ray Tracing**: Enable for detailed request tracing
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "lambda.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+```
 
-## Error Handling
+Attach the following inline permission policy:
 
-The Lambda function currently prints all SQS messages and returns without errors. For production use, consider:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:*:*:*"
+    },
+    {
+      "Sid": "SQSRequestQueue",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": [
+        "arn:aws:sqs:us-east-2:YOUR_ACCOUNT_ID:PIM-SQS",
+        "arn:aws:sqs:us-east-2:YOUR_ACCOUNT_ID:PIM-SQS-TEST"
+      ]
+    },
+    {
+      "Sid": "SQSResponseQueue",
+      "Effect": "Allow",
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:us-east-2:SLACK_BOT_ACCOUNT_ID:PIM-SQS-Response"
+    },
+    {
+      "Sid": "DynamoDB",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": "arn:aws:dynamodb:us-east-2:YOUR_ACCOUNT_ID:table/pim-requests"
+    },
+    {
+      "Sid": "SecretsManager",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:us-east-2:YOUR_ACCOUNT_ID:secret:pim-approvers-secret*"
+    },
+    {
+      "Sid": "SES",
+      "Effect": "Allow",
+      "Action": "ses:SendEmail",
+      "Resource": "*"
+    },
+    {
+      "Sid": "IdentityCenter",
+      "Effect": "Allow",
+      "Action": [
+        "sso-admin:ListInstances",
+        "sso-admin:ListPermissionSets",
+        "sso-admin:CreateAccountAssignment",
+        "sso-admin:DeleteAccountAssignment",
+        "sso-admin:ListAccountAssignments",
+        "sso-admin:DescribePermissionSet",
+        "identitystore:ListUsers",
+        "identitystore:DescribeUser",
+        "organizations:DescribeAccount"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
 
-1. **Error Handling**: Add try-catch for message processing
-2. **Dead Letter Queues**: Configure SQS DLQ for failed messages  
-3. **Partial Batch Failures**: Return specific failed message IDs
-4. **Retry Logic**: Implement exponential backoff for AWS API calls
+---
 
-## Scaling
+## 7. SQS Message Formats
 
-- **Concurrent Executions**: Lambda auto-scales based on SQS queue length
-- **Batch Size**: Adjust `--batch-size` parameter (1-10 for SQS)
-- **Reserved Concurrency**: Set limits to control scaling
+### Incoming request (from Slack bot → `PIM-SQS` / `PIM-SQS-TEST`)
+
+```json
+{
+  "request_id": "a1b2c3d4e5f6g7h8",
+  "requestor": "user@example.com",
+  "requestor_slack_user_id": "U0984U1QKFY",
+  "approver": "manager@example.com",
+  "account": "123456789012",
+  "datetime": "2026-06-05 10:00"
+}
+```
+
+### Outgoing response (Lambda → `PIM-SQS-Response`)
+
+```json
+{
+  "request_id": "a1b2c3d4e5f6g7h8",
+  "slack_user_id": "U0984U1QKFY",
+  "account_id": "123456789012",
+  "account_name": "",
+  "status": "granted",
+  "reason": ""
+}
+```
+
+| Status | Meaning |
+|---|---|
+| `granted` | Permission assigned successfully |
+| `rejected` | Request refused (unauthorized approver, management account, etc.) |
+| `failed` | Technical error during assignment |
+| `revoked` | Access removed (used by cleanup path, not this handler) |
+
+---
+
+## 8. Test Locally
+
+### Run unit tests
+
+```bash
+go test -v ./...
+```
+
+### Invoke the Lambda directly via AWS CLI
+
+```bash
+# Create a test payload
+cat > /tmp/test-event.json << 'EOF'
+{
+  "Records": [
+    {
+      "messageId": "test-message-1",
+      "receiptHandle": "test-receipt-handle",
+      "body": "{\"request_id\":\"a1b2c3d4e5f6\",\"requestor\":\"user@example.com\",\"requestor_slack_user_id\":\"U0984U1QKFY\",\"approver\":\"manager@example.com\",\"account\":\"123456789012\",\"datetime\":\"2026-06-05 10:00\"}",
+      "attributes": {
+        "ApproximateReceiveCount": "1",
+        "SentTimestamp": "1234567890000"
+      },
+      "messageAttributes": {},
+      "eventSource": "aws:sqs",
+      "eventSourceARN": "arn:aws:sqs:us-east-2:YOUR_ACCOUNT_ID:PIM-SQS-TEST"
+    }
+  ]
+}
+EOF
+
+aws lambda invoke \
+  --function-name pim-manager \
+  --payload file:///tmp/test-event.json \
+  --cli-binary-format raw-in-base64-out \
+  /tmp/response.json && cat /tmp/response.json
+```
+
+### Manually trigger the cleanup (EventBridge-style event)
+
+```bash
+cat > /tmp/cleanup-event.json << 'EOF'
+{
+  "version": "0",
+  "id": "test-event-id",
+  "source": "aws.events",
+  "detail-type": "Scheduled Event",
+  "time": "2026-06-05T10:00:00Z",
+  "region": "us-east-2",
+  "detail": {}
+}
+EOF
+
+aws lambda invoke \
+  --function-name pim-manager \
+  --payload file:///tmp/cleanup-event.json \
+  --cli-binary-format raw-in-base64-out \
+  /tmp/response.json && cat /tmp/response.json
+```
+
+---
+
+## 9. Monitoring
+
+| What | Where |
+|---|---|
+| Execution logs | CloudWatch Logs → `/aws/lambda/pim-manager` |
+| Error rate | CloudWatch Metrics → `AWS/Lambda` → `Errors` |
+| SQS queue depth | CloudWatch Metrics → `AWS/SQS` → `ApproximateNumberOfMessagesVisible` |
+| Dead-letter queue | Configure a DLQ on `PIM-SQS` to catch messages that fail repeatedly |
+
+Enable `LOG_LEVEL=debug` temporarily to see full message bodies and email addresses in logs. **Do not leave debug logging on in production** — it logs PII.
+
+---
+
+## 10. Dead-Letter Queue (recommended)
+
+Configure a DLQ on the request queue so that messages that fail processing 3+ times are captured for manual inspection:
+
+```bash
+aws sqs set-queue-attributes \
+  --queue-url https://sqs.us-east-2.amazonaws.com/YOUR_ACCOUNT_ID/PIM-SQS \
+  --attributes '{"RedrivePolicy":"{\"deadLetterTargetArn\":\"arn:aws:sqs:us-east-2:YOUR_ACCOUNT_ID:PIM-SQS-DLQ\",\"maxReceiveCount\":\"3\"}"}'
+```
