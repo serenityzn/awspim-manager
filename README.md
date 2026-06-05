@@ -363,4 +363,4 @@ awspim-manager/
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE) — free to use, modify, and distribute, but all derivative works must also be open source and retain the original copyright.
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
