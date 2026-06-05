@@ -1,5 +1,7 @@
 # awspim-manager
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+
 AWS Lambda service that manages temporary privileged access to AWS accounts using **AWS IAM Identity Center (SSO)**. It grants a user a permission set for a fixed duration, then automatically revokes it when the time expires.
 
 This is the **backend (Lambda) component** of the PIM system. The **Slack bot frontend** that sends access requests lives at [github.com/serenityzn/awspim](https://github.com/serenityzn/awspim). The full **Terraform infrastructure** for the entire system is at [github.com/serenityzn/awspim/tree/main/terraform](https://github.com/serenityzn/awspim/tree/main/terraform).
@@ -358,3 +360,7 @@ awspim-manager/
 
 - **Slack bot (frontend):** [github.com/serenityzn/awspim](https://github.com/serenityzn/awspim)
 - **Terraform (full infrastructure):** [github.com/serenityzn/awspim/tree/main/terraform](https://github.com/serenityzn/awspim/tree/main/terraform)
+
+## License
+
+This project is licensed under the [GNU General Public License v3.0](LICENSE) — free to use, modify, and distribute, but all derivative works must also be open source and retain the original copyright.
