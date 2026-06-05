@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: |
+          AWS_REGION=us-east-2 \
+          DYNAMO_TABLE=test-pim-requests \
+          APPROVERS=test-approvers-secret \
+          MANAGEMENT_ACCOUNT=000000000000 \
+          SESSION_TIMEOUT=3600 \
+          SES_FROM_EMAIL=noreply@example.com \
+          SQS_RESPONSE_QUEUE_URL=https://sqs.us-east-2.amazonaws.com/000000000000/PIM-SQS-Response \
+          go test ./...
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

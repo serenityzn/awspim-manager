@@ -1,9 +1,10 @@
-.PHONY: build test test-verbose lint clean
+.PHONY: build test test-verbose lint clean release-dry-run
 
 # ── Build ────────────────────────────────────────────────────────────────────
 
 build:
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o pim .
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags lambda.norpc -o bootstrap .
+	zip lambda-function.zip bootstrap
 
 # ── Test ─────────────────────────────────────────────────────────────────────
 # Environment variables are set here as a reliable fallback.
@@ -16,7 +17,9 @@ TEST_ENV := \
 	MANAGEMENT_ACCOUNT=000000000000 \
 	LOG_LEVEL=info \
 	PIM_ROLE=AdministratorAccess \
-	SESSION_TIMEOUT=3600
+	SESSION_TIMEOUT=3600 \
+	SES_FROM_EMAIL=noreply@example.com \
+	SQS_RESPONSE_QUEUE_URL=https://sqs.us-east-2.amazonaws.com/000000000000/PIM-SQS-Response
 
 test:
 	$(TEST_ENV) go test ./...
@@ -29,7 +32,13 @@ test-verbose:
 lint:
 	go vet ./...
 
+# ── Release ──────────────────────────────────────────────────────────────────
+
+release-dry-run:
+	goreleaser release --snapshot --clean
+
 # ── Clean ────────────────────────────────────────────────────────────────────
 
 clean:
-	rm -f pim
+	rm -f bootstrap lambda-function.zip
+	rm -rf dist/

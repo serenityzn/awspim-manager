@@ -1,0 +1,62 @@
+version: 2
+
+project_name: awspim-manager
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: lambda
+    binary: bootstrap
+    main: .
+    goos:
+      - linux
+    goarch:
+      - arm64
+    env:
+      - CGO_ENABLED=0
+    tags:
+      - lambda.norpc
+    ldflags:
+      - -s -w
+
+archives:
+  - id: lambda-zip
+    builds:
+      - lambda
+    name_template: "lambda-function"
+    format: zip
+    files:
+      - none*
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  github:
+    owner: serenityzn
+    name: awspim-manager
+  name_template: "v{{ .Version }}"
+  header: |
+    ## awspim-manager {{ .Tag }}
+  footer: |
+    ### Deployment
+    Upload `lambda-function.zip` to the Lambda function via the AWS Console or:
+    ```bash
+    aws lambda update-function-code \
+      --function-name test-pim-approver-assigner \
+      --region us-east-2 \
+      --zip-file fileb://lambda-function.zip
+    ```
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
