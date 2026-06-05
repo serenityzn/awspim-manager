@@ -2,7 +2,7 @@
 
 AWS Lambda service that manages temporary privileged access to AWS accounts using **AWS IAM Identity Center (SSO)**. It grants a user a permission set for a fixed duration, then automatically revokes it when the time expires.
 
-This is the **backend (Lambda) component** of the PIM system. The **Slack bot frontend** that sends access requests lives at [github.com/serenityzn/awspim](https://github.com/serenityzn/awspim).
+This is the **backend (Lambda) component** of the PIM system. The **Slack bot frontend** that sends access requests lives at [github.com/serenityzn/awspim](https://github.com/serenityzn/awspim). The full **Terraform infrastructure** for the entire system is at [github.com/serenityzn/awspim/tree/main/terraform](https://github.com/serenityzn/awspim/tree/main/terraform).
 
 ---
 
@@ -87,6 +87,8 @@ After processing, the Lambda sends a result back to the response queue:
 | `DYNAMO_TABLE` | Yes | — | DynamoDB table name (e.g. `pim-requests`) |
 | `APPROVERS` | Yes | — | Secrets Manager secret name containing a JSON array of authorized approver emails |
 | `MANAGEMENT_ACCOUNT` | Yes | — | AWS account ID of the management account (access to this account is always blocked) |
+| `SQS_RESPONSE_QUEUE_URL` | Yes | — | Full URL of the Slack bot response queue (`PIM-SQS-Response`) |
+| `SES_FROM_EMAIL` | Yes | — | Verified SES sender address for email notifications |
 | `SESSION_TIMEOUT` | No | `3600` | Access duration in seconds |
 | `PIM_ROLE` | No | `AdministratorAccess` | Name of the Identity Center permission set to grant/revoke |
 | `LOG_LEVEL` | No | `info` | Log verbosity: `info` or `debug`. **Use `debug` only temporarily** — it logs PII (emails, account IDs) to CloudWatch |
@@ -254,14 +256,14 @@ The Lambda execution role needs:
     {
       "Effect": "Allow",
       "Action": [
-        "sso-admin:ListInstances",
-        "sso-admin:ListPermissionSets",
-        "sso-admin:DescribePermissionSet",
-        "sso-admin:CreateAccountAssignment",
-        "sso-admin:DeleteAccountAssignment",
-        "sso-admin:DescribeAccountAssignmentCreationStatus",
-        "sso-admin:DescribeAccountAssignmentDeletionStatus",
-        "sso-admin:ListAccountAssignments",
+        "sso:ListInstances",
+        "sso:ListPermissionSets",
+        "sso:DescribePermissionSet",
+        "sso:CreateAccountAssignment",
+        "sso:DeleteAccountAssignment",
+        "sso:DescribeAccountAssignmentCreationStatus",
+        "sso:DescribeAccountAssignmentDeletionStatus",
+        "sso:ListAccountAssignments",
         "identitystore:ListUsers",
         "identitystore:DescribeUser",
         "organizations:DescribeAccount"
